@@ -32,6 +32,7 @@ add_subdirectory(shims/gbm)
 add_subdirectory(shims/egl)
 add_subdirectory(shims/glibc)
 add_subdirectory(shims/wayland)
+add_subdirectory(shims/udev)
 
 # --- Output dylib: absorbs all shims, embeds amfiexceptiond + framebufferd ---
 add_library(wayland-mac SHARED shims/wayland-mac.c)
@@ -44,6 +45,7 @@ target_link_libraries(wayland-mac PRIVATE
   -Wl,-force_load,$<TARGET_FILE:drm>
   -Wl,-force_load,$<TARGET_FILE:gbm>
   -Wl,-force_load,$<TARGET_FILE:egl-shim>
+  -Wl,-force_load,$<TARGET_FILE:udev>
 )
 
 # Expose all shim APIs via the single umbrella header <wayland-mac.h>.
@@ -75,6 +77,7 @@ add_dependencies(wayland-mac
   egl-shim
   glibc-compat
   wayland
+  udev
   amfiexceptiond
   framebufferd
 )

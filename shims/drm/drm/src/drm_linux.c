@@ -100,6 +100,7 @@ int drmGetCap(int fd, uint64_t capability, uint64_t *value)
     case DRM_CAP_PRIME:               *value = 3; break;
     case DRM_CAP_TIMESTAMP_MONOTONIC: *value = 1; break;
     case DRM_CAP_ASYNC_PAGE_FLIP:     *value = 0; break;
+    case DRM_CAP_CRTC_IN_VBLANK_EVENT: *value = 1; break;
     case DRM_CAP_CURSOR_WIDTH:        *value = 64; break;
     case DRM_CAP_CURSOR_HEIGHT:       *value = 64; break;
     case DRM_CAP_ADDFB2_MODIFIERS:    *value = 0; break;

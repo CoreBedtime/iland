@@ -1,5 +1,7 @@
 #include "glibc-compat.h"
 #include <sys/cdefs.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 /* funopen is a BSD/macOS extension; may be hidden by _POSIX_C_SOURCE */
 FILE *funopen(const void *cookie,
@@ -77,3 +79,87 @@ struct udev_seat *udev_seat_get_named(struct udev_input *u,
     (void)u;(void)seat_name;
     return NULL;
 }
+
+/* ── libseat stubs (override the broken stub in deps/libseat.dylib) ── */
+
+struct libseat;
+struct libseat_seat_listener;
+
+/* Internal struct for our fake libseat — two ints: pipe_r, pipe_w */
+#define SEAT_PIPE_R_OFF 0
+#define SEAT_PIPE_W_OFF 4
+
+static void *seat_state(void)
+{
+    static struct {
+        int pipe_r;
+        int pipe_w;
+    } s = { -1, -1 };
+    if (s.pipe_r < 0) {
+        int p[2];
+        if (pipe(p) == 0) {
+            fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL) | O_NONBLOCK);
+            s.pipe_r = p[0]; s.pipe_w = p[1];
+        }
+    }
+    return &s;
+}
+
+struct libseat *libseat_open_seat(const struct libseat_seat_listener *l,
+                                   void *data)
+{
+    (void)l;(void)data;
+    return (struct libseat *)seat_state();
+}
+
+void libseat_close_seat(struct libseat *s) { (void)s; }
+
+int libseat_get_fd(struct libseat *s)
+{
+    int *pipes = (int *)s;
+    return pipes ? pipes[0] : -1; /* pipe_r */
+}
+
+int libseat_dispatch(struct libseat *s, int timeout)
+{
+    (void)timeout;
+    int *pipes = (int *)s;
+    if (pipes && pipes[0] >= 0) {
+        char buf[64];
+        while (read(pipes[0], buf, sizeof(buf)) > 0);
+    }
+    return 0;
+}
+
+int libseat_get_vt(struct libseat *s) { (void)s; return -1; }
+
+int libseat_open_device(struct libseat *s, const char *path, int *fd)
+{
+    (void)s;
+    if (!path || !fd) return -1;
+    int opened = open(path, O_RDWR);
+    if (opened < 0) return -1;
+    *fd = opened;
+    return opened; /* device_id = fd */
+}
+
+int libseat_close_device(struct libseat *s, int device_id)
+{
+    (void)s;
+    close(device_id);
+    return 0;
+}
+
+int libseat_disable_seat(struct libseat *s) { (void)s; return 0; }
+
+int libseat_switch_session(struct libseat *s, int session)
+{
+    (void)s;(void)session;
+    return 0;
+}
+
+typedef void (*libseat_log_handler)(int level, const char *fmt, void *ap);
+void libseat_set_log_handler(libseat_log_handler handler) { (void)handler; }
+
+enum libseat_log_level { LIBSEAT_LOG_LEVEL_NONE, LIBSEAT_LOG_LEVEL_INFO, LIBSEAT_LOG_LEVEL_DEBUG };
+void libseat_set_log_level(enum libseat_log_level level) { (void)level; }
