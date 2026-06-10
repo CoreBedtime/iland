@@ -1,0 +1,5 @@
+__cmake_systeminformation/
+build/
+.build/
+
+AGENTS.md
