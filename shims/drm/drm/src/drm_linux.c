@@ -206,7 +206,7 @@ drmModeEncoderPtr drmModeGetEncoder(int fd, uint32_t encoder_id)
     e->encoder_id     = 1;
     e->encoder_type   = 10;
     e->crtc_id        = 1;
-    e->possible_crtcs = 0x1;
+    e->possible_crtcs = 1;    /* bit 0 = CRTC pipe 0 */
     e->possible_clones= 0x0;
 
     return e;
@@ -1141,7 +1141,7 @@ drmModePlanePtr drmModeGetPlane(int fd, uint32_t plane_id)
     if (!p) return NULL;
 
     p->plane_id = plane_id;
-    p->possible_crtcs = 2;   /* bit 1 = CRTC 1 */
+    p->possible_crtcs = 1;   /* bit 0 = CRTC pipe 0 (our only CRTC) */
     p->gamma_size = 256;
     p->crtc_id    = 1;
     p->fb_id      = (uint32_t)get_obj_prop(
@@ -1434,7 +1434,7 @@ const char *
 drmGetFormatModifierName(uint64_t modifier)
 {
     if (modifier == DRM_FORMAT_MOD_LINEAR)
-        return "Linear";
+        return strdup("Linear");
     return NULL;
 }
 
@@ -1500,6 +1500,6 @@ const char *
 drmGetFormatModifierVendor(uint64_t modifier)
 {
     if (modifier == DRM_FORMAT_MOD_LINEAR)
-        return "NONE";
+        return strdup("NONE");
     return NULL;
 }

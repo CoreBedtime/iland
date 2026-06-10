@@ -3,11 +3,22 @@
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <execinfo.h>
 #include <IOSurface/IOSurface.h>
 
 static void *g_angle_handle = NULL;
 
+static void trace(const char *msg)
+{
+    write(STDERR_FILENO, msg, strlen(msg));
+    write(STDERR_FILENO, "\n", 1);
+}
+
 #define ANGLE_FN(name) static __typeof__(&name) real_##name = NULL
+
+/* Bit used to mark duplicate EGLConfigs that report XRGB8888 */
+#define XRGB_DUP_BIT ((EGLConfig)(uintptr_t)0x80000000)
 
 ANGLE_FN(eglGetDisplay);
 ANGLE_FN(eglInitialize);
@@ -173,6 +184,33 @@ EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config,
 {
     EGLShimDisplay *sd = unwrap_display(dpy);
     if (!sd) return real_eglGetConfigAttrib(dpy, config, attribute, value);
+
+    if (attribute == EGL_SURFACE_TYPE) {
+        if (!real_eglGetConfigAttrib(sd->angle_display, config,
+                                      attribute, value))
+            return EGL_FALSE;
+        if (*value & EGL_PBUFFER_BIT)
+            *value |= EGL_WINDOW_BIT;
+        return EGL_TRUE;
+    }
+
+    if (attribute == EGL_NATIVE_VISUAL_ID) {
+        static const EGLint rgba_attrs[] = {
+            EGL_ALPHA_SIZE, EGL_RED_SIZE, EGL_GREEN_SIZE, EGL_BLUE_SIZE
+        };
+        EGLint rgba[4];
+        for (int i = 0; i < 4; i++) {
+            if (!real_eglGetConfigAttrib(sd->angle_display, config,
+                                          rgba_attrs[i], &rgba[i]))
+                return EGL_FALSE;
+        }
+        if (rgba[1] == 8 && rgba[2] == 8 && rgba[3] == 8) {
+            *value = rgba[0] == 8 ? 0x34325241  /* AR24 → ARGB8888 */
+                                  : 0x34325258; /* XR24 → XRGB8888 */
+            return EGL_TRUE;
+        }
+    }
+
     return real_eglGetConfigAttrib(sd->angle_display, config, attribute, value);
 }
 
@@ -180,6 +218,7 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config,
                              EGLContext share_context,
                              const EGLint *attrib_list)
 {
+    trace("==== eglCreateContext ====");
     EGLShimDisplay *sd = unwrap_display(dpy);
     if (!sd) return real_eglCreateContext(dpy, config, share_context, attrib_list);
     return real_eglCreateContext(sd->angle_display, config, share_context, attrib_list);
@@ -187,6 +226,7 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config,
 
 EGLBoolean eglDestroyContext(EGLDisplay dpy, EGLContext ctx)
 {
+    trace("==== eglDestroyContext ====");
     EGLShimDisplay *sd = unwrap_display(dpy);
     if (!sd) return real_eglDestroyContext(dpy, ctx);
     return real_eglDestroyContext(sd->angle_display, ctx);
@@ -196,6 +236,7 @@ EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config,
                                    EGLNativeWindowType win,
                                    const EGLint *attrib_list)
 {
+    trace("==== eglCreateWindowSurface entered ====");
     EGLShimDisplay *sd = unwrap_display(dpy);
     if (!sd) return real_eglCreateWindowSurface(dpy, config, win, attrib_list);
 
@@ -215,18 +256,23 @@ EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config,
         EGL_NONE
     };
 
+    trace("==== about to call real_eglCreatePbufferSurface ====");
     ss->angle_surface = real_eglCreatePbufferSurface(sd->angle_display,
-                                                      config, pb_attribs);
+                                                       config, pb_attribs);
+    trace("==== back from real_eglCreatePbufferSurface ====");
     if (!ss->angle_surface) {
+        trace("==== pbuffer surface failed, free ss ====");
         free(ss);
         return EGL_NO_SURFACE;
     }
 
+    trace("==== returning from eglCreateWindowSurface ====");
     return (EGLSurface)ss;
 }
 
 EGLBoolean eglDestroySurface(EGLDisplay dpy, EGLSurface surface)
 {
+    trace("==== eglDestroySurface ====");
     EGLShimDisplay *sd = unwrap_display(dpy);
     if (!sd) return real_eglDestroySurface(dpy, surface);
 
@@ -241,6 +287,7 @@ EGLBoolean eglDestroySurface(EGLDisplay dpy, EGLSurface surface)
 EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw,
                            EGLSurface read, EGLContext ctx)
 {
+    trace("==== eglMakeCurrent ====");
     EGLShimDisplay *sd = unwrap_display(dpy);
     if (!sd) return real_eglMakeCurrent(dpy, draw, read, ctx);
 
@@ -255,6 +302,7 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw,
 
 EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface)
 {
+    trace("==== eglSwapBuffers entered ====");
     EGLShimDisplay *sd = unwrap_display(dpy);
     if (!sd) return real_eglSwapBuffers(dpy, surface);
 
@@ -290,7 +338,9 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface)
     }
 
     IOSurfaceUnlock(iosurf, 0, NULL);
+    trace("==== eglSwapBuffers freeing pixels ====");
     free(pixels);
+    trace("==== eglSwapBuffers done ====");
 
     gbm_surface_advance_write(gs);
 
