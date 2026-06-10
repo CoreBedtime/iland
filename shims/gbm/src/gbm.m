@@ -4,6 +4,10 @@
 #import <stdlib.h>
 #import <string.h>
 
+/* Register GBM buffer handles so drmModeAddFB can resolve them. */
+extern void drm_register_gbm_buffer(uint32_t handle, void *surface);
+extern void drm_unregister_gbm_buffer(uint32_t handle);
+
 static IOSurfaceRef create_iosurface(uint32_t width, uint32_t height,
                                       uint32_t format)
 {
@@ -60,6 +64,8 @@ struct gbm_surface *gbm_surface_create(struct gbm_device *gbm,
         bo->format = format;
         bo->surface = create_iosurface(width, height, format);
         if (!bo->surface) { free(bo); goto fail; }
+        drm_register_gbm_buffer((uint32_t)IOSurfaceGetID(bo->surface),
+                                (void*)bo->surface);
         surf->bos[i] = bo;
     }
     return surf;
@@ -67,8 +73,11 @@ struct gbm_surface *gbm_surface_create(struct gbm_device *gbm,
 fail:
     for (int i = 0; i < GBM_NUM_BUFFERS; i++) {
         if (surf->bos[i]) {
-            if (surf->bos[i]->surface)
+            if (surf->bos[i]->surface) {
+                drm_unregister_gbm_buffer(
+                    (uint32_t)IOSurfaceGetID(surf->bos[i]->surface));
                 CFRelease(surf->bos[i]->surface);
+            }
             free(surf->bos[i]);
         }
     }
@@ -81,8 +90,11 @@ void gbm_surface_destroy(struct gbm_surface *surface)
     if (!surface) return;
     for (int i = 0; i < GBM_NUM_BUFFERS; i++) {
         if (surface->bos[i]) {
-            if (surface->bos[i]->surface)
+            if (surface->bos[i]->surface) {
+                drm_unregister_gbm_buffer(
+                    (uint32_t)IOSurfaceGetID(surface->bos[i]->surface));
                 CFRelease(surface->bos[i]->surface);
+            }
             free(surface->bos[i]);
         }
     }

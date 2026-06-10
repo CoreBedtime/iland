@@ -372,6 +372,51 @@ int drmModeMapDumbBuffer(int fd, uint32_t handle, uint64_t *offset)
     return -1;
 }
 
+/* ── GBM buffer handle table ────────────────────────────────────────────
+ * GBM creates IOSurface-backed buffers with opaque handles.  When kmscube
+ * passes those handles to drmModeAddFB, we need to find the IOSurface.  */
+
+#define MAX_GBM_BUFS 64
+
+typedef struct {
+    uint32_t     handle;
+    IOSurfaceRef surface;
+} gbm_buf_entry_t;
+
+static gbm_buf_entry_t g_gbm_bufs[MAX_GBM_BUFS];
+static int             g_gbm_buf_count;
+
+void drm_register_gbm_buffer(uint32_t handle, void *surface)
+{
+    if (!surface || handle == 0) return;
+    for (int i = 0; i < g_gbm_buf_count; i++)
+        if (g_gbm_bufs[i].handle == handle) {
+            g_gbm_bufs[i].surface = (IOSurfaceRef)surface;
+            return;
+        }
+    if (g_gbm_buf_count >= MAX_GBM_BUFS) return;
+    g_gbm_bufs[g_gbm_buf_count].handle  = handle;
+    g_gbm_bufs[g_gbm_buf_count].surface = (IOSurfaceRef)surface;
+    g_gbm_buf_count++;
+}
+
+void drm_unregister_gbm_buffer(uint32_t handle)
+{
+    for (int i = 0; i < g_gbm_buf_count; i++)
+        if (g_gbm_bufs[i].handle == handle) {
+            g_gbm_bufs[i] = g_gbm_bufs[--g_gbm_buf_count];
+            return;
+        }
+}
+
+static IOSurfaceRef lookup_gbm_buffer(uint32_t handle)
+{
+    for (int i = 0; i < g_gbm_buf_count; i++)
+        if (g_gbm_bufs[i].handle == handle)
+            return g_gbm_bufs[i].surface;
+    return NULL;
+}
+
 /* ── framebuffers ─────────────────────────────────────────────────────── */
 
 int drmModeAddFB(int fd, uint32_t width, uint32_t height,
@@ -382,7 +427,7 @@ int drmModeAddFB(int fd, uint32_t width, uint32_t height,
     if (check_fd(fd) < 0) return -1;
     if (!buf_id) { errno = EINVAL; return -1; }
 
-    /* Find the dumb buffer backing this handle */
+    /* Find the dumb buffer or GBM buffer backing this handle */
     IOSurfaceRef surf = NULL;
     for (int i = 0; i < MAX_DUMB_BUFS; i++) {
         if (g_dumb[i].handle == bo_handle) {
@@ -390,6 +435,8 @@ int drmModeAddFB(int fd, uint32_t width, uint32_t height,
             break;
         }
     }
+    if (!surf)
+        surf = lookup_gbm_buffer(bo_handle);
     if (!surf) { errno = ENOENT; return -1; }
 
     /* Find free FB slot */
@@ -601,7 +648,7 @@ typedef struct {
     uint64_t prop_vals[MAX_PROPS_PER_OBJ];
 } obj_props_t;
 
-static obj_props_t g_obj_props[8];
+static obj_props_t g_obj_props[16];
 static int         g_obj_prop_count;
 
 /* IN_FORMATS blob: reports supported formats + LINEAR modifier */
@@ -757,7 +804,8 @@ static uint32_t lookup_prop_id(const char *name)
 static obj_props_t *get_obj_props(uint32_t obj_id, uint32_t obj_type)
 {
     for (int i = 0; i < g_obj_prop_count; i++)
-        if (g_obj_props[i].obj_id == obj_id)
+        if (g_obj_props[i].obj_id == obj_id
+            && g_obj_props[i].obj_type == obj_type)
             return &g_obj_props[i];
     if (g_obj_prop_count >= (int)(sizeof(g_obj_props)/sizeof(g_obj_props[0])))
         return NULL;
@@ -1151,7 +1199,8 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReq *req,
         uint32_t prop_id = req->prop_ids[i];
         uint64_t val     = req->values[i];
 
-        /* Find the object's prop record */
+        /* Find the object's prop record (matched by obj_id only —
+         * atomic API doesn't carry obj_type in the request)         */
         obj_props_t *op = NULL;
         for (int j = 0; j < g_obj_prop_count; j++)
             if (g_obj_props[j].obj_id == obj_id) {

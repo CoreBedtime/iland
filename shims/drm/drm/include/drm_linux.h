@@ -225,6 +225,11 @@ int drmModeAddFB2WithModifiers(int fd, uint32_t width, uint32_t height,
 
 int drmModeRmFB(int fd, uint32_t buf_id);
 
+/* GBM buffer registration — called by gbm.m so drmModeAddFB can resolve
+ * GBM-created buffer handles to IOSurfaces.                          */
+void drm_register_gbm_buffer(uint32_t handle, void *surface);
+void drm_unregister_gbm_buffer(uint32_t handle);
+
 /* ── page flip ────────────────────────────────────────────────────────── */
 
 int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id,
