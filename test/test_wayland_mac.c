@@ -1,3 +1,4 @@
+#include "drm.h"
 #include <stdio.h>
 
 extern void wayland_mac_init(void);
@@ -5,6 +6,14 @@ extern void wayland_mac_init(void);
 int main(void) {
     printf("[test] wayland-mac loaded\n");
     wayland_mac_init();
-    printf("[test] wayland_mac_init returned\n");
+
+    const char *msg = "{\"event\":\"test\",\"source\":\"test_wayland_mac\"}";
+    printf("[test] sending: %s\n", msg);
+    int ret = drm_send_json(msg);
+    if (ret == 0)
+        printf("[test] drm_send_json ok\n");
+    else
+        printf("[test] drm_send_json failed (framebufferd not running?)\n");
+
     return 0;
 }

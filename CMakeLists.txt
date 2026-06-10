@@ -24,7 +24,7 @@ FetchContent_MakeAvailable(dobby)
 add_subdirectory(shims/epoll)
 add_subdirectory(shims/drm)
 
-# --- Output dylib: absorbs all shims, embeds amfree + framebufferd ---
+# --- Output dylib: absorbs all shims, embeds amfiexceptiond + framebufferd ---
 add_library(wayland-mac SHARED shims/wayland-mac.c)
 
 target_link_libraries(wayland-mac PRIVATE
@@ -33,8 +33,11 @@ target_link_libraries(wayland-mac PRIVATE
   -Wl,-force_load,$<TARGET_FILE:drm>
 )
 
+# Expose drm's public headers to consumers of wayland-mac
+target_link_libraries(wayland-mac PUBLIC drm)
+
 target_link_options(wayland-mac PRIVATE
-  -Wl,-sectcreate,__DATA_OBJ,amfree,$<TARGET_FILE:amfree>
+  -Wl,-sectcreate,__DATA_OBJ,amfiexceptiond,$<TARGET_FILE:amfiexceptiond>
   -Wl,-sectcreate,__DATA_OBJ,framebufferd,$<TARGET_FILE:framebufferd>
 )
 
@@ -42,7 +45,7 @@ add_dependencies(wayland-mac
   epoll-shim-interpose
   dobby
   drm
-  amfree
+  amfiexceptiond
   framebufferd
 )
 
