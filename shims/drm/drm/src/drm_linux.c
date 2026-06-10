@@ -1428,3 +1428,19 @@ int drmModeAddFB2WithModifiers(int fd, uint32_t width, uint32_t height,
                         bo_handles ? bo_handles[0] : 0,
                         buf_id);
 }
+
+const char *
+drmGetFormatModifierName(uint64_t modifier)
+{
+    if (modifier == DRM_FORMAT_MOD_LINEAR)
+        return "Linear";
+    return NULL;
+}
+
+const char *
+drmGetFormatModifierVendor(uint64_t modifier)
+{
+    if (modifier == DRM_FORMAT_MOD_LINEAR)
+        return "NONE";
+    return NULL;
+}

@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -81,6 +82,32 @@ typedef struct drmModeEncoder {
 #define DRM_MODE_CONNECTOR_eDP          14
 #define DRM_MODE_CONNECTOR_VIRTUAL      15
 #define DRM_MODE_CONNECTOR_DSI          16
+#define DRM_MODE_CONNECTOR_DPI          17
+#define DRM_MODE_CONNECTOR_WRITEBACK    18
+
+#define DRM_MODE_TYPE_USERDEF       0x00000020
+#define DRM_MODE_TYPE_PREFERRED     0x00000040
+
+#define DRM_MODE_FLAG_PHSYNC        0x00000001
+#define DRM_MODE_FLAG_NHSYNC        0x00000002
+#define DRM_MODE_FLAG_PVSYNC        0x00000004
+#define DRM_MODE_FLAG_NVSYNC        0x00000008
+#define DRM_MODE_FLAG_INTERLACE     0x00000010
+#define DRM_MODE_FLAG_DBLSCAN       0x00000020
+
+#define DRM_MODE_FLAG_PIC_AR_MASK   0x00000F00
+#define DRM_MODE_FLAG_PIC_AR_NONE   0x00000100
+#define DRM_MODE_FLAG_PIC_AR_4_3    0x00000200
+#define DRM_MODE_FLAG_PIC_AR_16_9   0x00000400
+#define DRM_MODE_FLAG_PIC_AR_64_27  0x00000800
+#define DRM_MODE_FLAG_PIC_AR_256_135 0x00001000
+
+#define DRM_MODE_SUBPIXEL_UNKNOWN        1
+#define DRM_MODE_SUBPIXEL_NONE           2
+#define DRM_MODE_SUBPIXEL_HORIZONTAL_RGB 3
+#define DRM_MODE_SUBPIXEL_HORIZONTAL_BGR 4
+#define DRM_MODE_SUBPIXEL_VERTICAL_RGB   5
+#define DRM_MODE_SUBPIXEL_VERTICAL_BGR   6
 
 typedef struct drmModeConnector {
     uint32_t         connector_id;
@@ -145,10 +172,28 @@ typedef struct drmModePlaneRes {
     uint32_t *planes;
 } drmModePlaneRes, *drmModePlaneResPtr;
 
+struct hdr_metadata_infoframe {
+	uint16_t eotf;
+	uint8_t  metadata_type;
+	struct { uint16_t x, y; } display_primaries[3];
+	struct { uint16_t x, y; } white_point;
+	uint16_t max_display_mastering_luminance;
+	uint16_t min_display_mastering_luminance;
+	uint16_t max_cll;
+	uint16_t max_fall;
+};
+
+struct hdr_output_metadata {
+	uint32_t metadata_type;
+	struct hdr_metadata_infoframe hdmi_metadata_type1;
+};
+
+typedef drmModePropertyBlobRes *drmModePropertyBlobPtr;
+
 #define DRM_MODE_PAGE_FLIP_EVENT 0x01
 #define DRM_MODE_PAGE_FLIP_ASYNC 0x02
 
-#define DRM_EVENT_CONTEXT_VERSION 2
+#define DRM_EVENT_CONTEXT_VERSION 3
 
 typedef struct drmEventContext {
     int version;
@@ -162,6 +207,12 @@ typedef struct drmEventContext {
                               unsigned int tv_sec,
                               unsigned int tv_usec,
                               void *user_data);
+    void (*page_flip_handler2)(int fd,
+                               unsigned int sequence,
+                               unsigned int tv_sec,
+                               unsigned int tv_usec,
+                               unsigned int crtc_id,
+                               void *user_data);
 } drmEventContext, *drmEventContextPtr;
 
 #define DRM_MODE_PROP_RANGE         (1 << 0)
@@ -171,6 +222,7 @@ typedef struct drmEventContext {
 #define DRM_MODE_PROP_IMMUTABLE     (1 << 4)
 #define DRM_MODE_PROP_ATOMIC        (1 << 5)
 #define DRM_MODE_PROP_PENDING       (1 << 6)
+#define DRM_MODE_PROP_SIGNED_RANGE  (1 << 13)
 
 #define DRM_MODE_OBJECT_CRTC        0xCCCCCCCC
 #define DRM_MODE_OBJECT_CONNECTOR   0xC0C0C0C0
@@ -224,12 +276,20 @@ int drmModeAddFB2WithModifiers(int fd, uint32_t width, uint32_t height,
                                const uint32_t bo_handles[4],
                                const uint32_t pitches[4],
                                const uint32_t offsets[4],
+                               const uint64_t modifier[4],
                                uint32_t *buf_id, uint32_t flags);
 
 int drmModeRmFB(int fd, uint32_t buf_id);
 
 int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id,
                     uint32_t flags, void *user_data);
+
+int drmModeSetPlane(int fd, uint32_t plane_id, uint32_t crtc_id,
+                    uint32_t fb_id, uint32_t flags,
+                    int32_t crtc_x, int32_t crtc_y,
+                    uint32_t crtc_w, uint32_t crtc_h,
+                    uint32_t src_x, uint32_t src_y,
+                    uint32_t src_w, uint32_t src_h);
 
 int drmHandleEvent(int fd, drmEventContextPtr evctx);
 
@@ -270,6 +330,20 @@ int               drmModeAtomicAddProperty(drmModeAtomicReq *req,
                                            uint64_t value);
 int               drmModeAtomicCommit(int fd, drmModeAtomicReq *req,
                                       uint32_t flags, void *user_data);
+
+typedef struct _drmModeFormatModifierIterator {
+	uint32_t fmt_idx, mod_idx;
+	uint32_t fmt;
+	uint64_t mod;
+} drmModeFormatModifierIterator;
+
+bool drmModeFormatModifierBlobIterNext(const drmModePropertyBlobRes *blob,
+                                       drmModeFormatModifierIterator *iter);
+
+int drmModeCrtcSetGamma(int fd, uint32_t crtc_id, uint32_t size,
+                        uint16_t *red, uint16_t *green, uint16_t *blue);
+int drmModeConnectorSetProperty(int fd, uint32_t connector_id,
+                                uint32_t property_id, uint64_t value);
 
 int drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle);
 int drmSyncobjDestroy(int fd, uint32_t handle);
