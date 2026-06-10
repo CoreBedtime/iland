@@ -1,0 +1,259 @@
+/*
+ * drm_linux.h — Linux-compatible DRM API shim for macOS.
+ *
+ * Provides the subset of xf86drm.h / drm_mode.h used by Wayland compositors
+ * (wlroots, mutter, etc.).  All functions are implemented as stubs that route
+ * through the Mach IPC channel to framebufferd; unsupported ioctls return -1
+ * with errno = ENOSYS.
+ */
+
+#ifndef DRM_LINUX_H
+#define DRM_LINUX_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ── basic types ──────────────────────────────────────────────────────── */
+
+typedef unsigned int  drm_handle_t;
+typedef unsigned int  drm_context_t;
+typedef unsigned int  drm_drawable_t;
+typedef unsigned long drm_magic_t;
+
+/* ── connector / encoder / CRTC id types (opaque uint32) ─────────────── */
+
+typedef uint32_t drmModeConnectorID;
+typedef uint32_t drmModeEncoderID;
+typedef uint32_t drmModeCrtcID;
+
+/* ── mode info ────────────────────────────────────────────────────────── */
+
+typedef struct drmModeModeInfo {
+    uint32_t clock;
+    uint16_t hdisplay, hsync_start, hsync_end, htotal, hskew;
+    uint16_t vdisplay, vsync_start, vsync_end, vtotal, vscan;
+    uint32_t vrefresh;
+    uint32_t flags;
+    uint32_t type;
+    char     name[32];
+} drmModeModeInfo;
+
+/* ── framebuffer ──────────────────────────────────────────────────────── */
+
+typedef struct drmModeFB {
+    uint32_t fb_id;
+    uint32_t width, height;
+    uint32_t pitch;
+    uint32_t bpp;
+    uint32_t depth;
+    uint32_t handle;
+} drmModeFB, *drmModeFBPtr;
+
+/* ── CRTC ─────────────────────────────────────────────────────────────── */
+
+typedef struct drmModeCrtc {
+    uint32_t        crtc_id;
+    uint32_t        buffer_id;
+    uint32_t        x, y;
+    uint32_t        width, height;
+    int             mode_valid;
+    drmModeModeInfo mode;
+    int             gamma_size;
+} drmModeCrtc, *drmModeCrtcPtr;
+
+/* ── encoder ──────────────────────────────────────────────────────────── */
+
+typedef struct drmModeEncoder {
+    uint32_t encoder_id;
+    uint32_t encoder_type;
+    uint32_t crtc_id;
+    uint32_t possible_crtcs;
+    uint32_t possible_clones;
+} drmModeEncoder, *drmModeEncoderPtr;
+
+/* ── connector ────────────────────────────────────────────────────────── */
+
+#define DRM_MODE_CONNECTED         1
+#define DRM_MODE_DISCONNECTED      2
+#define DRM_MODE_UNKNOWNCONNECTION 3
+
+#define DRM_MODE_CONNECTOR_Unknown      0
+#define DRM_MODE_CONNECTOR_VGA          1
+#define DRM_MODE_CONNECTOR_DVII         2
+#define DRM_MODE_CONNECTOR_DVID         3
+#define DRM_MODE_CONNECTOR_DVIA         4
+#define DRM_MODE_CONNECTOR_Composite    5
+#define DRM_MODE_CONNECTOR_SVIDEO       6
+#define DRM_MODE_CONNECTOR_LVDS         7
+#define DRM_MODE_CONNECTOR_Component    8
+#define DRM_MODE_CONNECTOR_9PinDIN      9
+#define DRM_MODE_CONNECTOR_DisplayPort  10
+#define DRM_MODE_CONNECTOR_HDMIA        11
+#define DRM_MODE_CONNECTOR_HDMIB        12
+#define DRM_MODE_CONNECTOR_TV           13
+#define DRM_MODE_CONNECTOR_eDP          14
+#define DRM_MODE_CONNECTOR_VIRTUAL      15
+#define DRM_MODE_CONNECTOR_DSI          16
+
+typedef struct drmModeConnector {
+    uint32_t         connector_id;
+    uint32_t         encoder_id;
+    uint32_t         connector_type;
+    uint32_t         connector_type_id;
+    uint32_t         connection;       /* DRM_MODE_CONNECTED etc. */
+    uint32_t         mmWidth, mmHeight;
+    uint32_t         subpixel;
+    int              count_modes;
+    drmModeModeInfo *modes;
+    int              count_props;
+    uint32_t        *props;
+    uint64_t        *prop_values;
+    int              count_encoders;
+    uint32_t        *encoders;
+} drmModeConnector, *drmModeConnectorPtr;
+
+/* ── resource set ─────────────────────────────────────────────────────── */
+
+typedef struct drmModeRes {
+    int       count_fbs;
+    uint32_t *fbs;
+    int       count_crtcs;
+    uint32_t *crtcs;
+    int       count_connectors;
+    uint32_t *connectors;
+    int       count_encoders;
+    uint32_t *encoders;
+    uint32_t  min_width,  max_width;
+    uint32_t  min_height, max_height;
+} drmModeRes, *drmModeResPtr;
+
+/* ── page-flip event ──────────────────────────────────────────────────── */
+
+#define DRM_EVENT_CONTEXT_VERSION 2
+
+typedef struct drmEventContext {
+    int version;
+    void (*vblank_handler)(int fd,
+                           unsigned int sequence,
+                           unsigned int tv_sec,
+                           unsigned int tv_usec,
+                           void *user_data);
+    void (*page_flip_handler)(int fd,
+                              unsigned int sequence,
+                              unsigned int tv_sec,
+                              unsigned int tv_usec,
+                              void *user_data);
+} drmEventContext, *drmEventContextPtr;
+
+/* ── page-flip flags ──────────────────────────────────────────────────── */
+
+#define DRM_MODE_PAGE_FLIP_EVENT 0x01
+#define DRM_MODE_PAGE_FLIP_ASYNC 0x02
+
+/* ── prime ────────────────────────────────────────────────────────────── */
+
+#define DRM_CLOEXEC  0x80000000
+#define DRM_RDWR     0x40000000
+
+/* ── open / close ─────────────────────────────────────────────────────── */
+
+int  drmOpen(const char *name, const char *busid);
+int  drmOpenWithType(const char *name, const char *busid, int type);
+int  drmClose(int fd);
+
+/* ── capability ───────────────────────────────────────────────────────── */
+
+#define DRM_CAP_DUMB_BUFFER          0x1
+#define DRM_CAP_VBLANK_HIGH_CRTC     0x2
+#define DRM_CAP_DUMB_PREFERRED_DEPTH 0x3
+#define DRM_CAP_DUMB_PREFER_SHADOW   0x4
+#define DRM_CAP_PRIME                0x5
+#define DRM_CAP_TIMESTAMP_MONOTONIC  0x6
+#define DRM_CAP_ASYNC_PAGE_FLIP      0x7
+#define DRM_CAP_CURSOR_WIDTH         0x8
+#define DRM_CAP_CURSOR_HEIGHT        0x9
+#define DRM_CAP_ADDFB2_MODIFIERS     0x10
+#define DRM_CAP_PAGE_FLIP_TARGET     0x11
+#define DRM_CAP_CRTC_IN_VBLANK_EVENT 0x12
+#define DRM_CAP_SYNCOBJ             0x13
+
+int drmGetCap(int fd, uint64_t capability, uint64_t *value);
+
+/* ── mode resources ───────────────────────────────────────────────────── */
+
+drmModeResPtr       drmModeGetResources(int fd);
+void                drmModeFreeResources(drmModeResPtr ptr);
+
+drmModeConnectorPtr drmModeGetConnector(int fd, uint32_t connector_id);
+void                drmModeFreeConnector(drmModeConnectorPtr ptr);
+
+drmModeEncoderPtr   drmModeGetEncoder(int fd, uint32_t encoder_id);
+void                drmModeFreeEncoder(drmModeEncoderPtr ptr);
+
+drmModeCrtcPtr      drmModeGetCrtc(int fd, uint32_t crtc_id);
+void                drmModeFreeCrtc(drmModeCrtcPtr ptr);
+
+int drmModeSetCrtc(int fd, uint32_t crtc_id, uint32_t fb_id,
+                   uint32_t x, uint32_t y,
+                   uint32_t *connectors, int count,
+                   drmModeModeInfo *mode);
+
+/* ── framebuffer ──────────────────────────────────────────────────────── */
+
+int drmModeAddFB(int fd, uint32_t width, uint32_t height,
+                 uint8_t depth, uint8_t bpp,
+                 uint32_t pitch, uint32_t bo_handle,
+                 uint32_t *buf_id);
+
+int drmModeAddFB2(int fd, uint32_t width, uint32_t height,
+                  uint32_t pixel_format,
+                  const uint32_t bo_handles[4],
+                  const uint32_t pitches[4],
+                  const uint32_t offsets[4],
+                  uint32_t *buf_id, uint32_t flags);
+
+int drmModeRmFB(int fd, uint32_t buf_id);
+
+/* ── page flip ────────────────────────────────────────────────────────── */
+
+int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id,
+                    uint32_t flags, void *user_data);
+
+int drmHandleEvent(int fd, drmEventContextPtr evctx);
+
+/* ── dumb buffers ─────────────────────────────────────────────────────── */
+
+int drmModeCreateDumbBuffer(int fd, uint32_t width, uint32_t height,
+                            uint32_t bpp, uint32_t flags,
+                            uint32_t *handle, uint32_t *pitch,
+                            uint64_t *size);
+
+int drmModeDestroyDumbBuffer(int fd, uint32_t handle);
+
+int drmModeMapDumbBuffer(int fd, uint32_t handle, uint64_t *offset);
+
+/* ── prime ────────────────────────────────────────────────────────────── */
+
+int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd);
+int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle);
+
+/* ── generic ioctl passthrough ────────────────────────────────────────── */
+
+int drmIoctl(int fd, unsigned long request, void *arg);
+
+/* ── auth / master ────────────────────────────────────────────────────── */
+
+int drmGetMagic(int fd, drm_magic_t *magic);
+int drmAuthMagic(int fd, drm_magic_t magic);
+int drmSetMaster(int fd);
+int drmDropMaster(int fd);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* DRM_LINUX_H */

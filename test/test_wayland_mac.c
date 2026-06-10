@@ -1,7 +1,5 @@
-#include "drm.h"
+#include <wayland-mac.h>
 #include <stdio.h>
-
-extern void wayland_mac_init(void);
 
 int main(void) {
     printf("[test] wayland-mac loaded\n");

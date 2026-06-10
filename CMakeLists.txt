@@ -22,19 +22,30 @@ set(Dobby_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(dobby)
 
 add_subdirectory(shims/epoll)
+# Override the epoll-shim's -fvisibility=hidden so its symbols are
+# exported from the wayland-mac dylib.
+set_target_properties(epoll-shim-interpose PROPERTIES
+  C_VISIBILITY_PRESET "default"
+)
 add_subdirectory(shims/drm)
 
 # --- Output dylib: absorbs all shims, embeds amfiexceptiond + framebufferd ---
 add_library(wayland-mac SHARED shims/wayland-mac.c)
 
 target_link_libraries(wayland-mac PRIVATE
-  -Wl,-force_load,$<TARGET_FILE:epoll-shim-interpose>
   -Wl,-force_load,$<TARGET_FILE:dobby>
+  -Wl,-force_load,$<TARGET_FILE:epoll-shim-interpose>
   -Wl,-force_load,$<TARGET_FILE:drm>
 )
 
-# Expose drm's public headers to consumers of wayland-mac
+# Expose all shim APIs via the single umbrella header <wayland-mac.h>.
+# Shim-specific headers (epoll, drm) are propagated transitively through
+# each library target's PUBLIC include directories.
 target_link_libraries(wayland-mac PUBLIC drm)
+target_include_directories(wayland-mac PUBLIC
+  ${CMAKE_SOURCE_DIR}/shims
+  $<TARGET_PROPERTY:epoll-shim-interpose,INTERFACE_INCLUDE_DIRECTORIES>
+)
 
 target_link_options(wayland-mac PRIVATE
   -Wl,-sectcreate,__DATA_OBJ,amfiexceptiond,$<TARGET_FILE:amfiexceptiond>

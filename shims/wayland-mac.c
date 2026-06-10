@@ -1,3 +1,4 @@
+#include <_abort.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>
@@ -77,7 +78,21 @@ __attribute__((constructor))
 static void wayland_mac_load(void) {
     if (getuid() != 0) {
         fprintf(stderr, "[wayland-mac] must run as root\n");
+        abort();
         return;
+    }
+
+    /* If framebufferd's Mach service is already registered, everything is
+     * already set up — skip support dir, amfi, and framebufferd spawn. */
+    {
+        mach_port_t port = MACH_PORT_NULL;
+        kern_return_t kr = bootstrap_look_up(bootstrap_port,
+                                            "com.wayland-mac.framebufferd",
+                                            &port);
+        if (kr == KERN_SUCCESS) {
+            mach_port_deallocate(mach_task_self(), port);
+            return;  /* already running, nothing to do */
+        }
     }
 
     /* Create support directory */
@@ -99,7 +114,7 @@ static void wayland_mac_load(void) {
         spawn_and_wait(amfiexceptiond_path, argv);
     }
 
-    /* Extract and launch framebufferd */
+    /* Extract and launch framebufferd, then wait for its Mach service */
     if (extract_section("__DATA_OBJ", "framebufferd", framebufferd_path) == 0) {
         char *const argv[] = {
             (char *)framebufferd_path,
@@ -108,7 +123,6 @@ static void wayland_mac_load(void) {
         spawn_background(framebufferd_path, argv);
     }
 
-    /* Block until framebufferd has registered its Mach service */
     {
         mach_port_t port = MACH_PORT_NULL;
         kern_return_t kr;
@@ -116,7 +130,7 @@ static void wayland_mac_load(void) {
             kr = bootstrap_look_up(bootstrap_port,
                                    "com.wayland-mac.framebufferd", &port);
             if (kr != KERN_SUCCESS)
-                usleep(5000); /* 5 ms */
+                usleep(5000);
         } while (kr != KERN_SUCCESS);
         mach_port_deallocate(mach_task_self(), port);
     }
