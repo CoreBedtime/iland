@@ -17,6 +17,10 @@
 #include <poll.h>
 #include <signal.h>
 
+/* DRM ioctl dispatch — intercepts open/ioctl for /dev/dri/card* */
+#include <sys/ioctl.h>
+#include "drm_ioctl.h"
+
 /* epoll shim functions we hook into — forward-declared to avoid pulling
  * in epoll_shim_ctx.h and its system-compat dependencies */
 ssize_t epoll_shim_read(int fd, void *buf, size_t nbytes);
@@ -40,6 +44,8 @@ typeof(write) *wrap_real_write;
 typeof(close) *wrap_real_close;
 typeof(poll)  *wrap_real_poll;
 typeof(fcntl) *wrap_real_fcntl;
+typeof(open)  *wrap_real_open;
+typeof(ioctl) *wrap_real_ioctl;
 
 static ssize_t hooked_read(int fd, void *buf, size_t nbytes)
 {
@@ -53,6 +59,8 @@ static ssize_t hooked_write(int fd, void const *buf, size_t nbytes)
 
 static int hooked_close(int fd)
 {
+    if (fd == DRM_VIRTUAL_FD)
+        return 0;
     return epoll_shim_close(fd);
 }
 
@@ -69,6 +77,35 @@ static int hooked_fcntl(int fd, int cmd, ...)
     int rv = epoll_shim_fcntl(fd, cmd, arg);
     va_end(ap);
     return rv;
+}
+
+/* ── DRM open/ioctl hooks ───────────────────────────────────────────── */
+
+static int hooked_open(const char *path, int flags, ...)
+{
+    va_list ap;
+    va_start(ap, flags);
+    int mode = (flags & O_CREAT) ? va_arg(ap, int) : 0;
+    va_end(ap);
+
+    if (path && strncmp(path, "/dev/dri/card", 13) == 0) {
+        const char *rest = path + 13;
+        if (*rest >= '0' && *rest <= '9')
+            return DRM_VIRTUAL_FD;
+    }
+    return wrap_real_open(path, flags, mode);
+}
+
+static int hooked_ioctl(int fd, unsigned long request, ...)
+{
+    va_list ap;
+    va_start(ap, request);
+    void *arg = va_arg(ap, void *);
+    va_end(ap);
+
+    if (fd == DRM_VIRTUAL_FD)
+        return drm_ioctl_dispatch(request, arg);
+    return wrap_real_ioctl(fd, request, arg);
 }
 
 static void install_epoll_hooks(void)
@@ -152,7 +189,21 @@ static int spawn_background(const char *path, char *const argv[]) {
 
 static void install_drm_hooks(void)
 {
-    (void)0; /* TODO: add Dobby hooks for drm* functions */
+    int ret;
+
+    ret = DobbyHook((void *)open,      (void *)hooked_open,
+                    (void **)&wrap_real_open);
+    if (ret != 0) {
+        fprintf(stderr, "wayland-mac: error hooking \"open\" with DobbyHook!\n");
+        abort();
+    }
+
+    ret = DobbyHook((void *)ioctl,     (void *)hooked_ioctl,
+                    (void **)&wrap_real_ioctl);
+    if (ret != 0) {
+        fprintf(stderr, "wayland-mac: error hooking \"ioctl\" with DobbyHook!\n");
+        abort();
+    }
 }
 
 __attribute__((constructor))

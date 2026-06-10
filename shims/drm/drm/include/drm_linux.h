@@ -216,6 +216,13 @@ int drmModeAddFB2(int fd, uint32_t width, uint32_t height,
                   const uint32_t offsets[4],
                   uint32_t *buf_id, uint32_t flags);
 
+int drmModeAddFB2WithModifiers(int fd, uint32_t width, uint32_t height,
+                               uint32_t pixel_format,
+                               const uint32_t bo_handles[4],
+                               const uint32_t pitches[4],
+                               const uint32_t offsets[4],
+                               uint32_t *buf_id, uint32_t flags);
+
 int drmModeRmFB(int fd, uint32_t buf_id);
 
 /* ── page flip ────────────────────────────────────────────────────────── */
@@ -244,6 +251,140 @@ int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle);
 /* ── generic ioctl passthrough ────────────────────────────────────────── */
 
 int drmIoctl(int fd, unsigned long request, void *arg);
+
+/* ── client capability ────────────────────────────────────────────────── */
+
+#define DRM_CLIENT_CAP_STEREO_3D         1
+#define DRM_CLIENT_CAP_UNIVERSAL_PLANES  2
+#define DRM_CLIENT_CAP_ATOMIC            3
+#define DRM_CLIENT_CAP_ASPECT_RATIO      4
+#define DRM_CLIENT_CAP_WRITEBACK_CONNECTORS 5
+
+int drmSetClientCap(int fd, uint64_t capability, uint64_t value);
+
+/* ── format codes (FourCC) ───────────────────────────────────────────── */
+
+#define DRM_FORMAT_XRGB8888         0x34325258
+#define DRM_FORMAT_ARGB8888         0x34325241
+#define DRM_FORMAT_XBGR8888         0x34324258
+#define DRM_FORMAT_ABGR8888         0x34324241
+#define DRM_FORMAT_RGB565           0x36314752
+#define DRM_FORMAT_XRGB2101010      0x30335258
+#define DRM_FORMAT_ARGB2101010      0x30335241
+#define DRM_FORMAT_XBGR2101010      0x30334258
+#define DRM_FORMAT_ABGR2101010      0x30334241
+#define DRM_FORMAT_MOD_LINEAR       0
+#define DRM_FORMAT_MOD_INVALID      ((uint64_t)1 << 56)
+
+/* ── properties ───────────────────────────────────────────────────────── */
+
+#define DRM_MODE_PROP_RANGE         (1 << 0)
+#define DRM_MODE_PROP_ENUM          (1 << 1)
+#define DRM_MODE_PROP_BLOB          (1 << 2)
+#define DRM_MODE_PROP_BITMASK       (1 << 3)
+#define DRM_MODE_PROP_IMMUTABLE     (1 << 4)
+#define DRM_MODE_PROP_ATOMIC        (1 << 5)
+#define DRM_MODE_PROP_PENDING       (1 << 6)
+
+#define DRM_MODE_OBJECT_CRTC        0xCCCCCCCC
+#define DRM_MODE_OBJECT_CONNECTOR   0xC0C0C0C0
+#define DRM_MODE_OBJECT_ENCODER     0xE0E0E0E0
+#define DRM_MODE_OBJECT_MODE        0xDEDEDEDE
+#define DRM_MODE_OBJECT_PROPERTY    0xB0B0B0B0
+#define DRM_MODE_OBJECT_FB          0xFBFBFBFB
+#define DRM_MODE_OBJECT_BLOB        0xBBBBBBBB
+#define DRM_MODE_OBJECT_PLANE       0xEEEEEEEE
+#define DRM_MODE_OBJECT_ANY         0
+
+typedef struct drmModePropertyRes {
+    uint32_t  prop_id;
+    uint32_t  flags;
+    char      name[32];
+    uint32_t  count_values;
+    uint64_t *values;
+    uint32_t  count_enums;
+    struct {
+        uint64_t value;
+        char     name[32];
+    } *enums;
+    uint32_t  count_blobs;
+    uint32_t *blob_ids;
+} drmModePropertyRes, *drmModePropertyResPtr;
+
+typedef struct drmModeObjectProperties {
+    uint32_t  count_props;
+    uint32_t *props;
+    uint64_t *prop_values;
+} drmModeObjectProperties, *drmModeObjectPropertiesPtr;
+
+typedef struct drmModePropertyBlobRes {
+    uint32_t id;
+    uint32_t length;
+    void    *data;
+} drmModePropertyBlobRes, *drmModePropertyBlobResPtr;
+
+drmModePropertyResPtr       drmModeGetProperty(int fd, uint32_t property_id);
+void                        drmModeFreeProperty(drmModePropertyResPtr ptr);
+drmModeObjectPropertiesPtr  drmModeObjectGetProperties(int fd, uint32_t object_id, uint32_t object_type);
+void                        drmModeFreeObjectProperties(drmModeObjectPropertiesPtr ptr);
+drmModePropertyBlobResPtr   drmModeGetPropertyBlob(int fd, uint32_t blob_id);
+void                        drmModeFreePropertyBlob(drmModePropertyBlobResPtr ptr);
+int                         drmModeCreatePropertyBlob(int fd, const void *data, size_t length, uint32_t *blob_id);
+int                         drmModeDestroyPropertyBlob(int fd, uint32_t blob_id);
+
+/* ── planes ───────────────────────────────────────────────────────────── */
+
+#define DRM_PLANE_TYPE_OVERLAY   0
+#define DRM_PLANE_TYPE_PRIMARY   1
+#define DRM_PLANE_TYPE_CURSOR    2
+
+typedef struct drmModePlane {
+    uint32_t  possible_crtcs;
+    uint32_t  gamma_size;
+    uint32_t  count_formats;
+    uint32_t *formats;
+    uint32_t  plane_id;
+    uint32_t  crtc_id;
+    uint32_t  fb_id;
+    uint64_t *format_modifiers;
+} drmModePlane, *drmModePlanePtr;
+
+typedef struct drmModePlaneRes {
+    uint32_t  count_planes;
+    uint32_t *planes;
+} drmModePlaneRes, *drmModePlaneResPtr;
+
+drmModePlaneResPtr     drmModeGetPlaneResources(int fd);
+drmModePlanePtr        drmModeGetPlane(int fd, uint32_t plane_id);
+void                   drmModeFreePlaneResources(drmModePlaneResPtr ptr);
+void                   drmModeFreePlane(drmModePlanePtr ptr);
+
+/* ── atomic mode setting ──────────────────────────────────────────────── */
+
+#define DRM_MODE_ATOMIC_TEST_ONLY      0x0100
+#define DRM_MODE_ATOMIC_NONBLOCK       0x0200
+#define DRM_MODE_ATOMIC_ALLOW_MODESET  0x0400
+
+typedef struct _drmModeAtomicReq drmModeAtomicReq;
+
+drmModeAtomicReq *drmModeAtomicAlloc(void);
+void              drmModeAtomicFree(drmModeAtomicReq *req);
+int               drmModeAtomicAddProperty(drmModeAtomicReq *req, uint32_t object_id, uint32_t property_id, uint64_t value);
+int               drmModeAtomicCommit(int fd, drmModeAtomicReq *req, uint32_t flags, void *user_data);
+
+/* ── cursor ───────────────────────────────────────────────────────────── */
+
+int drmModeSetCursor(int fd, uint32_t crtc_id, uint32_t bo_handle, uint32_t width, uint32_t height);
+int drmModeMoveCursor(int fd, uint32_t crtc_id, int x, int y);
+
+/* ── sync objects ─────────────────────────────────────────────────────── */
+
+int drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle);
+int drmSyncobjDestroy(int fd, uint32_t handle);
+int drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd);
+int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd);
+int drmSyncobjFDToHandle(int fd, int sync_file_fd, uint32_t *handle);
+int drmSyncobjHandleToFD(int fd, uint32_t handle, int *sync_file_fd);
 
 /* ── auth / master ────────────────────────────────────────────────────── */
 

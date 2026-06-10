@@ -6,3 +6,6 @@ target_link_libraries(test_drm PRIVATE wayland-mac)
 
 add_executable(test_epoll test_epoll.c)
 target_link_libraries(test_epoll PRIVATE wayland-mac)
+
+add_executable(test_drm_system_ties test_drm_system_ties.c)
+target_link_libraries(test_drm_system_ties PRIVATE wayland-mac)

@@ -1,15 +1,16 @@
 #include "drm_linux.h"
 #include "drm.h"
+#include "drm_ioctl.h"
 
 #include <IOSurface/IOSurface.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <mach/mach.h>
-
-#define DRM_VIRTUAL_FD  42
+#include <unistd.h>
 
 /* ── static mode table ────────────────────────────────────────────────── */
 
@@ -505,24 +506,6 @@ int drmHandleEvent(int fd, drmEventContextPtr evctx)
     return 0;
 }
 
-/* ── prime stubs ──────────────────────────────────────────────────────── */
-
-int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
-{
-    (void)fd; (void)handle; (void)flags;
-    if (prime_fd) *prime_fd = -1;
-    errno = ENOSYS;
-    return -1;
-}
-
-int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
-{
-    (void)fd; (void)prime_fd;
-    if (handle) *handle = 0;
-    errno = ENOSYS;
-    return -1;
-}
-
 /* ── generic ioctl ────────────────────────────────────────────────────── */
 
 int drmIoctl(int fd, unsigned long request, void *arg)
@@ -558,4 +541,804 @@ int drmDropMaster(int fd)
 {
     if (check_fd(fd) < 0) return -1;
     return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  Property / Plane / Atomic / Cursor / Sync  implementation
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── client capabilities ─────────────────────────────────────────────── */
+
+static struct {
+    uint64_t universal_planes;
+    uint64_t atomic;
+} g_client_caps;
+
+int drmSetClientCap(int fd, uint64_t capability, uint64_t value)
+{
+    if (check_fd(fd) < 0) return -1;
+    switch (capability) {
+    case DRM_CLIENT_CAP_UNIVERSAL_PLANES:
+        g_client_caps.universal_planes = value;
+        return 0;
+    case DRM_CLIENT_CAP_ATOMIC:
+        g_client_caps.atomic = value;
+        return 0;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+}
+
+/* ── property store ──────────────────────────────────────────────────── */
+
+#define MAX_PROPS         64
+#define MAX_PROPS_PER_OBJ 16
+#define MAX_BLOBS         32
+
+typedef struct {
+    uint32_t id;
+    uint32_t flags;
+    char     name[32];
+    uint32_t count_values;
+    uint64_t values[4];          
+    uint32_t count_enums;
+    struct {
+        uint64_t value;
+        char     name[32];
+    } enums[8];
+    uint32_t count_blobs;
+} prop_def_t;
+
+static prop_def_t  g_props[MAX_PROPS];
+static int         g_prop_count;
+
+typedef struct {
+    uint32_t obj_id;
+    uint32_t obj_type;
+    int      prop_count;
+    uint32_t prop_ids[MAX_PROPS_PER_OBJ];
+    uint64_t prop_vals[MAX_PROPS_PER_OBJ];
+} obj_props_t;
+
+static obj_props_t g_obj_props[8];
+static int         g_obj_prop_count;
+
+/* IN_FORMATS blob: reports supported formats + LINEAR modifier */
+typedef struct { uint32_t format; uint64_t modifier; } fmt_mod_pair;
+
+static fmt_mod_pair g_in_formats[] = {
+    { DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR },
+    { DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_LINEAR },
+    { DRM_FORMAT_XBGR8888, DRM_FORMAT_MOD_LINEAR },
+    { DRM_FORMAT_ABGR8888, DRM_FORMAT_MOD_LINEAR },
+};
+#define G_IN_FORMATS_COUNT  ((int)(sizeof(g_in_formats)/sizeof(g_in_formats[0])))
+
+static uint32_t g_blob_ids[MAX_BLOBS];
+static uint32_t g_blob_sizes[MAX_BLOBS];
+static void    *g_blob_data[MAX_BLOBS];
+static int      g_blob_count;
+static uint32_t g_next_blob_id = 256;
+
+static int add_prop(const char *name, uint32_t flags,
+                    uint32_t nvals, const uint64_t *vals)
+{
+    if (g_prop_count >= MAX_PROPS) return -1;
+    int i = g_prop_count++;
+    g_props[i].id = i + 1;
+    g_props[i].flags = flags;
+    strncpy(g_props[i].name, name, sizeof(g_props[i].name) - 1);
+    g_props[i].count_values = nvals;
+    for (uint32_t j = 0; j < nvals && j < 4; j++)
+        g_props[i].values[j] = vals[j];
+    g_props[i].count_enums = 0;
+    return g_props[i].id;
+}
+
+static int add_enum_prop(const char *name, uint32_t flags,
+                         const char *const *enum_names,
+                         const uint64_t *enum_vals, int enum_count)
+{
+    int id = add_prop(name, flags, 0, NULL);
+    if (id < 0) return -1;
+    int i = id - 1;
+    g_props[i].count_enums = enum_count;
+    for (int j = 0; j < enum_count && j < 8; j++) {
+        g_props[i].enums[j].value = enum_vals ? enum_vals[j] : j;
+        strncpy(g_props[i].enums[j].name,
+                enum_names[j], sizeof(g_props[i].enums[j].name) - 1);
+    }
+    return id;
+}
+
+static int add_blob_prop(const char *name, uint32_t flags)
+{
+    return add_prop(name, flags | DRM_MODE_PROP_BLOB, 0, NULL);
+}
+
+static void ensure_properties(void)
+{
+    if (g_prop_count > 0) return;
+
+    /* Connector properties */
+    {
+        const char *enames[] = {"OK", "off"};
+        uint64_t evals[] = {0, 1};
+        add_enum_prop("DPMS",
+            DRM_MODE_PROP_ENUM | DRM_MODE_PROP_ATOMIC, enames, evals, 2);
+    }
+    {
+        uint64_t rng[] = {0, 1};
+        add_prop("CRTC_ID",
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC | DRM_MODE_PROP_IMMUTABLE,
+            2, rng);
+    }
+    add_blob_prop("EDID", DRM_MODE_PROP_IMMUTABLE);
+
+    /* CRTC properties */
+    {
+        uint64_t rng[] = {0, 1};
+        add_prop("ACTIVE",
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC, 2, rng);
+    }
+    add_blob_prop("MODE_ID", DRM_MODE_PROP_ATOMIC);
+
+    /* Plane properties */
+    add_blob_prop("IN_FORMATS",
+        DRM_MODE_PROP_IMMUTABLE | DRM_MODE_PROP_BLOB);
+    {
+        uint64_t rng[] = {0, 0xFFFFFFFF};
+        add_prop("FB_ID",
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC, 2, rng);
+    }
+    {
+        uint64_t rng[] = {0, 0xFFFFFFFF};
+        add_prop("CRTC_X",
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC, 2, rng);
+    }
+    {
+        uint64_t rng[] = {0, 0xFFFFFFFF};
+        add_prop("CRTC_Y",
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC, 2, rng);
+    }
+    {
+        uint64_t rng[] = {0, 0xFFFFFFFF};
+        add_prop("CRTC_W",
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC, 2, rng);
+    }
+    {
+        uint64_t rng[] = {0, 0xFFFFFFFF};
+        add_prop("CRTC_H",
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC, 2, rng);
+    }
+    {
+        uint64_t rng[] = {0, 0xFFFFFFFF};
+        add_prop("SRC_X",
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC, 2, rng);
+    }
+    {
+        uint64_t rng[] = {0, 0xFFFFFFFF};
+        add_prop("SRC_Y",
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC, 2, rng);
+    }
+    {
+        uint64_t rng[] = {0, 0xFFFFFFFF};
+        add_prop("SRC_W",
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC, 2, rng);
+    }
+    {
+        uint64_t rng[] = {0, 0xFFFFFFFF};
+        add_prop("SRC_H",
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC, 2, rng);
+    }
+    {
+        const char *tnames[] = {"Overlay", "Primary", "Cursor"};
+        uint64_t tvals[] = {
+            DRM_PLANE_TYPE_OVERLAY,
+            DRM_PLANE_TYPE_PRIMARY,
+            DRM_PLANE_TYPE_CURSOR
+        };
+        add_enum_prop("type",
+            DRM_MODE_PROP_IMMUTABLE | DRM_MODE_PROP_ENUM,
+            tnames, tvals, 3);
+    }
+}
+
+static uint32_t lookup_prop_id(const char *name)
+{
+    for (int i = 0; i < g_prop_count; i++)
+        if (strcmp(g_props[i].name, name) == 0)
+            return g_props[i].id;
+    return 0;
+}
+
+/* Find or create object property record */
+static obj_props_t *get_obj_props(uint32_t obj_id, uint32_t obj_type)
+{
+    for (int i = 0; i < g_obj_prop_count; i++)
+        if (g_obj_props[i].obj_id == obj_id)
+            return &g_obj_props[i];
+    if (g_obj_prop_count >= (int)(sizeof(g_obj_props)/sizeof(g_obj_props[0])))
+        return NULL;
+    int i = g_obj_prop_count++;
+    g_obj_props[i].obj_id = obj_id;
+    g_obj_props[i].obj_type = obj_type;
+    g_obj_props[i].prop_count = 0;
+    return &g_obj_props[i];
+}
+
+static void set_obj_prop(obj_props_t *op, uint32_t prop_id, uint64_t val)
+{
+    for (int i = 0; i < op->prop_count; i++)
+        if (op->prop_ids[i] == prop_id) {
+            op->prop_vals[i] = val;
+            return;
+        }
+    if (op->prop_count >= MAX_PROPS_PER_OBJ) return;
+    int i = op->prop_count++;
+    op->prop_ids[i] = prop_id;
+    op->prop_vals[i] = val;
+}
+
+static uint64_t get_obj_prop(obj_props_t *op, uint32_t prop_id)
+{
+    for (int i = 0; i < op->prop_count; i++)
+        if (op->prop_ids[i] == prop_id)
+            return op->prop_vals[i];
+    return 0;
+}
+
+/* ensure each object has the right default properties */
+static void ensure_obj_properties(void)
+{
+    ensure_properties();
+
+    /* CRTC 1: default ACTIVE=1 */
+    obj_props_t *cr = get_obj_props(1, DRM_MODE_OBJECT_CRTC);
+    if (cr->prop_count == 0) {
+        set_obj_prop(cr, lookup_prop_id("ACTIVE"), 1);
+        set_obj_prop(cr, lookup_prop_id("MODE_ID"), 0);
+    }
+
+    /* Connector 1: default DPMS=0, CRTC_ID=0 */
+    obj_props_t *co = get_obj_props(1, DRM_MODE_OBJECT_CONNECTOR);
+    if (co->prop_count == 0) {
+        set_obj_prop(co, lookup_prop_id("DPMS"), 0);
+        set_obj_prop(co, lookup_prop_id("CRTC_ID"), 0);
+    }
+
+    /* Primary plane (1) */
+    obj_props_t *pp = get_obj_props(1, DRM_MODE_OBJECT_PLANE);
+    if (pp->prop_count == 0) {
+        set_obj_prop(pp, lookup_prop_id("type"), DRM_PLANE_TYPE_PRIMARY);
+        set_obj_prop(pp, lookup_prop_id("FB_ID"), 0);
+        set_obj_prop(pp, lookup_prop_id("CRTC_ID"), 0);
+        set_obj_prop(pp, lookup_prop_id("CRTC_X"), 0);
+        set_obj_prop(pp, lookup_prop_id("CRTC_Y"), 0);
+        set_obj_prop(pp, lookup_prop_id("CRTC_W"), 0);
+        set_obj_prop(pp, lookup_prop_id("CRTC_H"), 0);
+        set_obj_prop(pp, lookup_prop_id("SRC_X"), 0);
+        set_obj_prop(pp, lookup_prop_id("SRC_Y"), 0);
+        set_obj_prop(pp, lookup_prop_id("SRC_W"), 0);
+        set_obj_prop(pp, lookup_prop_id("SRC_H"), 0);
+    }
+
+    /* Cursor plane (2) */
+    obj_props_t *cp = get_obj_props(2, DRM_MODE_OBJECT_PLANE);
+    if (cp->prop_count == 0) {
+        set_obj_prop(cp, lookup_prop_id("type"), DRM_PLANE_TYPE_CURSOR);
+        set_obj_prop(cp, lookup_prop_id("FB_ID"), 0);
+        set_obj_prop(cp, lookup_prop_id("CRTC_ID"), 0);
+        set_obj_prop(cp, lookup_prop_id("CRTC_X"), 0);
+        set_obj_prop(cp, lookup_prop_id("CRTC_Y"), 0);
+        set_obj_prop(cp, lookup_prop_id("CRTC_W"), 64);
+        set_obj_prop(cp, lookup_prop_id("CRTC_H"), 64);
+        set_obj_prop(cp, lookup_prop_id("SRC_X"), 0);
+        set_obj_prop(cp, lookup_prop_id("SRC_Y"), 0);
+        set_obj_prop(cp, lookup_prop_id("SRC_W"), 64);
+        set_obj_prop(cp, lookup_prop_id("SRC_H"), 64);
+    }
+}
+
+/* ── blob management ─────────────────────────────────────────────────── */
+
+static uint32_t create_in_formats_blob(void)
+{
+    size_t sz   = sizeof(g_in_formats);
+    void  *data = malloc(sz);
+    if (!data) return 0;
+    memcpy(data, g_in_formats, sz);
+
+    int slot = -1;
+    for (int i = 0; i < MAX_BLOBS; i++)
+        if (g_blob_data[i] == NULL) { slot = i; break; }
+    if (slot < 0) { free(data); return 0; }
+
+    uint32_t id = g_next_blob_id++;
+    g_blob_ids[slot]  = id;
+    g_blob_sizes[slot]= sz;
+    g_blob_data[slot] = data;
+    return id;
+}
+
+static uint32_t get_or_create_in_formats_blob(void)
+{
+    for (int i = 0; i < MAX_BLOBS; i++)
+        if (g_blob_data[i] != NULL &&
+            g_blob_sizes[i] == sizeof(g_in_formats) &&
+            memcmp(g_blob_data[i], g_in_formats, sizeof(g_in_formats)) == 0)
+            return g_blob_ids[i];
+    return create_in_formats_blob();
+}
+
+/* ── property API ────────────────────────────────────────────────────── */
+
+drmModePropertyResPtr drmModeGetProperty(int fd, uint32_t property_id)
+{
+    if (check_fd(fd) < 0) return NULL;
+    ensure_properties();
+    if (property_id < 1 || property_id > (uint32_t)g_prop_count) {
+        errno = ENOENT;
+        return NULL;
+    }
+    const prop_def_t *pd = &g_props[property_id - 1];
+    drmModePropertyRes *p = calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    p->prop_id      = pd->id;
+    p->flags        = pd->flags;
+    memcpy(p->name, pd->name, sizeof(p->name));
+
+    p->count_values = pd->count_values;
+    if (pd->count_values > 0) {
+        p->values = malloc(pd->count_values * sizeof(uint64_t));
+        if (p->values) memcpy(p->values, pd->values, pd->count_values * sizeof(uint64_t));
+    }
+
+    p->count_enums  = pd->count_enums;
+    if (pd->count_enums > 0) {
+        size_t esz = sizeof(p->enums[0]) * pd->count_enums;
+        p->enums = malloc(esz);
+        if (p->enums) memcpy(p->enums, pd->enums, esz);
+    }
+
+    /* For IN_FORMATS, return the current blob id */
+    if (strcmp(pd->name, "IN_FORMATS") == 0 && pd->count_blobs == 0) {
+        p->count_blobs = 1;
+        p->blob_ids = malloc(sizeof(uint32_t));
+        if (p->blob_ids) p->blob_ids[0] = get_or_create_in_formats_blob();
+    }
+
+    return p;
+}
+
+void drmModeFreeProperty(drmModePropertyResPtr ptr)
+{
+    if (!ptr) return;
+    free(ptr->values);
+    free(ptr->enums);
+    free(ptr->blob_ids);
+    free(ptr);
+}
+
+drmModeObjectPropertiesPtr drmModeObjectGetProperties(int fd,
+    uint32_t object_id, uint32_t object_type)
+{
+    if (check_fd(fd) < 0) return NULL;
+    ensure_obj_properties();
+
+    obj_props_t *op = get_obj_props(object_id, object_type);
+    if (!op) { errno = ENOENT; return NULL; }
+
+    drmModeObjectProperties *p = calloc(1, sizeof(*p));
+    if (!p) return NULL;
+
+    p->count_props = op->prop_count;
+    p->props       = malloc(p->count_props * sizeof(uint32_t));
+    p->prop_values = malloc(p->count_props * sizeof(uint64_t));
+    if (p->props && p->prop_values) {
+        memcpy(p->props, op->prop_ids, p->count_props * sizeof(uint32_t));
+        memcpy(p->prop_values, op->prop_vals, p->count_props * sizeof(uint64_t));
+    }
+    return p;
+}
+
+void drmModeFreeObjectProperties(drmModeObjectPropertiesPtr ptr)
+{
+    if (!ptr) return;
+    free(ptr->props);
+    free(ptr->prop_values);
+    free(ptr);
+}
+
+drmModePropertyBlobResPtr drmModeGetPropertyBlob(int fd, uint32_t blob_id)
+{
+    if (check_fd(fd) < 0) return NULL;
+    for (int i = 0; i < MAX_BLOBS; i++)
+        if (g_blob_data[i] != NULL && g_blob_ids[i] == blob_id) {
+            drmModePropertyBlobRes *b = calloc(1, sizeof(*b));
+            if (!b) break;
+            b->id     = blob_id;
+            b->length = g_blob_sizes[i];
+            b->data   = malloc(b->length);
+            if (b->data) memcpy(b->data, g_blob_data[i], b->length);
+            return b;
+        }
+    errno = ENOENT;
+    return NULL;
+}
+
+void drmModeFreePropertyBlob(drmModePropertyBlobResPtr ptr)
+{
+    if (!ptr) return;
+    free(ptr->data);
+    free(ptr);
+}
+
+int drmModeCreatePropertyBlob(int fd, const void *data, size_t length,
+                              uint32_t *blob_id)
+{
+    if (check_fd(fd) < 0) return -1;
+    if (!data || !blob_id) { errno = EINVAL; return -1; }
+
+    int slot = -1;
+    for (int i = 0; i < MAX_BLOBS; i++)
+        if (g_blob_data[i] == NULL) { slot = i; break; }
+    if (slot < 0) { errno = ENOMEM; return -1; }
+
+    void *copy = malloc(length);
+    if (!copy) { errno = ENOMEM; return -1; }
+    memcpy(copy, data, length);
+
+    uint32_t id = g_next_blob_id++;
+    g_blob_ids[slot]   = id;
+    g_blob_sizes[slot] = length;
+    g_blob_data[slot]  = copy;
+    *blob_id = id;
+    return 0;
+}
+
+int drmModeDestroyPropertyBlob(int fd, uint32_t blob_id)
+{
+    if (check_fd(fd) < 0) return -1;
+    for (int i = 0; i < MAX_BLOBS; i++)
+        if (g_blob_data[i] != NULL && g_blob_ids[i] == blob_id) {
+            free(g_blob_data[i]);
+            g_blob_data[i] = NULL;
+            return 0;
+        }
+    errno = ENOENT;
+    return -1;
+}
+
+/* ── plane resources ─────────────────────────────────────────────────── */
+
+/* Virtual planes: 1=primary, 2=cursor, 3=overlay (all assoc. with CRTC 1) */
+static const uint32_t g_plane_ids[] = { 1, 2, 3 };
+#define G_PLANE_COUNT  ((int)(sizeof(g_plane_ids)/sizeof(g_plane_ids[0])))
+
+/* default supported formats per plane */
+static uint32_t g_primary_formats[] = { DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888 };
+static uint32_t g_cursor_formats[]  = { DRM_FORMAT_ARGB8888 };
+static uint32_t g_overlay_formats[] = { DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888 };
+
+drmModePlaneResPtr drmModeGetPlaneResources(int fd)
+{
+    if (check_fd(fd) < 0) return NULL;
+    if (!g_client_caps.universal_planes) {
+        errno = EOPNOTSUPP;
+        return NULL;
+    }
+
+    drmModePlaneRes *r = calloc(1, sizeof(*r));
+    if (!r) return NULL;
+    r->count_planes = G_PLANE_COUNT;
+    r->planes = malloc(G_PLANE_COUNT * sizeof(uint32_t));
+    if (r->planes) memcpy(r->planes, g_plane_ids,
+                          G_PLANE_COUNT * sizeof(uint32_t));
+    return r;
+}
+
+void drmModeFreePlaneResources(drmModePlaneResPtr ptr)
+{
+    if (!ptr) return;
+    free(ptr->planes);
+    free(ptr);
+}
+
+drmModePlanePtr drmModeGetPlane(int fd, uint32_t plane_id)
+{
+    if (check_fd(fd) < 0) return NULL;
+    ensure_obj_properties();
+
+    drmModePlane *p = calloc(1, sizeof(*p));
+    if (!p) return NULL;
+
+    p->plane_id = plane_id;
+    p->possible_crtcs = 2;   /* bit 1 = CRTC 1 */
+    p->gamma_size = 256;
+    p->crtc_id    = 1;
+    p->fb_id      = (uint32_t)get_obj_prop(
+                        get_obj_props(plane_id, DRM_MODE_OBJECT_PLANE),
+                        lookup_prop_id("FB_ID"));
+
+    switch (plane_id) {
+    case 1: /* primary */
+        p->count_formats = 2;
+        p->formats = malloc(2 * sizeof(uint32_t));
+        if (p->formats) { p->formats[0] = DRM_FORMAT_XRGB8888;
+                           p->formats[1] = DRM_FORMAT_ARGB8888; }
+        p->format_modifiers = NULL;
+        break;
+    case 2: /* cursor */
+        p->count_formats = 1;
+        p->formats = malloc(1 * sizeof(uint32_t));
+        if (p->formats) p->formats[0] = DRM_FORMAT_ARGB8888;
+        break;
+    case 3: /* overlay */
+        p->count_formats = 2;
+        p->formats = malloc(2 * sizeof(uint32_t));
+        if (p->formats) { p->formats[0] = DRM_FORMAT_XRGB8888;
+                           p->formats[1] = DRM_FORMAT_ARGB8888; }
+        break;
+    default:
+        free(p->formats);
+        free(p);
+        errno = ENOENT;
+        return NULL;
+    }
+    return p;
+}
+
+void drmModeFreePlane(drmModePlanePtr ptr)
+{
+    if (!ptr) return;
+    free(ptr->formats);
+    free(ptr->format_modifiers);
+    free(ptr);
+}
+
+/* ── atomic ──────────────────────────────────────────────────────────── */
+
+#define MAX_ATOMIC_PROPS 64
+
+struct _drmModeAtomicReq {
+    int      prop_count;
+    uint32_t obj_ids[MAX_ATOMIC_PROPS];
+    uint32_t prop_ids[MAX_ATOMIC_PROPS];
+    uint64_t values[MAX_ATOMIC_PROPS];
+};
+
+drmModeAtomicReq *drmModeAtomicAlloc(void)
+{
+    drmModeAtomicReq *req = calloc(1, sizeof(*req));
+    return req;
+}
+
+void drmModeAtomicFree(drmModeAtomicReq *req)
+{
+    free(req);
+}
+
+int drmModeAtomicAddProperty(drmModeAtomicReq *req,
+    uint32_t object_id, uint32_t property_id, uint64_t value)
+{
+    if (!req) { errno = EINVAL; return -1; }
+    if (req->prop_count >= MAX_ATOMIC_PROPS) { errno = ENOMEM; return -1; }
+    int i = req->prop_count++;
+    req->obj_ids[i]    = object_id;
+    req->prop_ids[i]   = property_id;
+    req->values[i]     = value;
+    return 0;
+}
+
+int drmModeAtomicCommit(int fd, drmModeAtomicReq *req,
+                        uint32_t flags, void *user_data)
+{
+    if (check_fd(fd) < 0) return -1;
+    if (!req) { errno = EINVAL; return -1; }
+
+    ensure_obj_properties();
+
+    /* Apply all property changes */
+    uint32_t new_fb_id = 0;
+    uint32_t new_plane_id = 0;
+    bool     page_flip = (flags & DRM_MODE_PAGE_FLIP_EVENT);
+    (void)page_flip;
+
+    for (int i = 0; i < req->prop_count; i++) {
+        uint32_t obj_id  = req->obj_ids[i];
+        uint32_t prop_id = req->prop_ids[i];
+        uint64_t val     = req->values[i];
+
+        /* Find the object's prop record */
+        obj_props_t *op = NULL;
+        for (int j = 0; j < g_obj_prop_count; j++)
+            if (g_obj_props[j].obj_id == obj_id) {
+                op = &g_obj_props[j]; break;
+            }
+        if (!op) continue;
+
+        set_obj_prop(op, prop_id, val);
+
+        /* Track FB_ID changes for page flip */
+        if (strcmp(g_props[prop_id - 1].name, "FB_ID") == 0) {
+            new_fb_id = (uint32_t)val;
+            new_plane_id = obj_id;
+        }
+    }
+
+    /* If this is a page flip with a new FB, send the surface */
+    if (flags & DRM_MODE_PAGE_FLIP_EVENT && new_fb_id > 0) {
+        /* Resolve FB to surface and send like drmModePageFlip */
+        IOSurfaceRef surf = fb_id_to_surface(new_fb_id);
+        if (surf) {
+            mach_port_t surface_port = IOSurfaceCreateMachPort(surf);
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                     "{\"op\":\"page_flip\",\"crtc\":1,\"fb\":%u,\"flags\":%u}",
+                     new_fb_id, flags);
+            drm_send_json_with_surface(buf, surface_port);
+            if (surface_port != MACH_PORT_NULL)
+                mach_port_deallocate(mach_task_self(), surface_port);
+        }
+        g_state.crtc_fb_id = new_fb_id;
+    }
+
+    (void)user_data;
+    return 0;
+}
+
+/* ── cursor ──────────────────────────────────────────────────────────── */
+
+static struct {
+    uint32_t    crtc_id;
+    uint32_t    bo_handle;
+    uint32_t    width;
+    uint32_t    height;
+    int         x;
+    int         y;
+    bool        active;
+} g_cursor;
+
+int drmModeSetCursor(int fd, uint32_t crtc_id, uint32_t bo_handle,
+                     uint32_t width, uint32_t height)
+{
+    if (check_fd(fd) < 0) return -1;
+    if (crtc_id != 1) { errno = ENOENT; return -1; }
+
+    g_cursor.crtc_id   = crtc_id;
+    g_cursor.bo_handle = bo_handle;
+    g_cursor.width     = width;
+    g_cursor.height    = height;
+    g_cursor.active    = true;
+
+    /* Send cursor surface to framebufferd */
+    IOSurfaceRef surf = NULL;
+    for (int i = 0; i < MAX_DUMB_BUFS; i++)
+        if (g_dumb[i].handle == bo_handle) { surf = g_dumb[i].surface; break; }
+
+    if (surf) {
+        mach_port_t surface_port = IOSurfaceCreateMachPort(surf);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "{\"op\":\"cursor_set\",\"crtc\":%u,\"w\":%u,\"h\":%u}",
+                 crtc_id, width, height);
+        drm_send_json_with_surface(buf, surface_port);
+        if (surface_port != MACH_PORT_NULL)
+            mach_port_deallocate(mach_task_self(), surface_port);
+    }
+
+    return 0;
+}
+
+int drmModeMoveCursor(int fd, uint32_t crtc_id, int x, int y)
+{
+    if (check_fd(fd) < 0) return -1;
+    if (crtc_id != 1) { errno = ENOENT; return -1; }
+
+    g_cursor.x = x;
+    g_cursor.y = y;
+
+    if (g_cursor.active) {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "{\"op\":\"cursor_move\",\"crtc\":%u,\"x\":%d,\"y\":%d}",
+                 crtc_id, x, y);
+        drm_send_json(buf);
+    }
+    return 0;
+}
+
+/* ── sync objects ────────────────────────────────────────────────────── */
+
+int drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
+{
+    if (check_fd(fd) < 0) return -1;
+    (void)flags;
+    if (handle) *handle = 42;  /* dummy handle */
+    return 0;
+}
+
+int drmSyncobjDestroy(int fd, uint32_t handle)
+{
+    if (check_fd(fd) < 0) return -1;
+    (void)handle;
+    return 0;
+}
+
+int drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd)
+{
+    if (check_fd(fd) < 0) return -1;
+    (void)handle; (void)sync_file_fd;
+    return 0;
+}
+
+int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
+{
+    if (check_fd(fd) < 0) return -1;
+    (void)handle;
+    if (sync_file_fd) *sync_file_fd = -1;
+    errno = ENOSYS;
+    return -1;
+}
+
+int drmSyncobjFDToHandle(int fd, int sync_file_fd, uint32_t *handle)
+{
+    if (check_fd(fd) < 0) return -1;
+    (void)sync_file_fd;
+    if (handle) *handle = 42;
+    return 0;
+}
+
+int drmSyncobjHandleToFD(int fd, uint32_t handle, int *sync_file_fd)
+{
+    if (check_fd(fd) < 0) return -1;
+    (void)handle;
+    if (sync_file_fd) *sync_file_fd = -1;
+    errno = ENOSYS;
+    return -1;
+}
+
+/* ── prime (properly stubbed) ────────────────────────────────────────── */
+
+int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
+{
+    if (check_fd(fd) < 0) return -1;
+    (void)handle; (void)flags;
+    /* Create a dummy fd so compositors don't crash on dma-buf import */
+    if (prime_fd) {
+        int p[2];
+        if (pipe(p) < 0) { errno = ENOSYS; return -1; }
+        close(p[1]);  /* close write end — compositor will get EOF on read */
+        *prime_fd = p[0];
+        return 0;
+    }
+    errno = EINVAL;
+    return -1;
+}
+
+int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
+{
+    if (check_fd(fd) < 0) return -1;
+    (void)prime_fd;
+    if (handle) *handle = 1;  /* dummy handle */
+    close(prime_fd);
+    return 0;
+}
+
+/* ── fb2 with modifiers ──────────────────────────────────────────────── */
+
+int drmModeAddFB2WithModifiers(int fd, uint32_t width, uint32_t height,
+                               uint32_t pixel_format,
+                               const uint32_t bo_handles[4],
+                               const uint32_t pitches[4],
+                               const uint32_t offsets[4],
+                               uint32_t *buf_id, uint32_t flags)
+{
+    (void)pixel_format; (void)offsets; (void)flags;
+    return drmModeAddFB(fd, width, height, 24, 32,
+                        pitches ? pitches[0] : 0,
+                        bo_handles ? bo_handles[0] : 0,
+                        buf_id);
 }

@@ -54,6 +54,13 @@ static IOSurfaceRef  g_client_surface;
 static pthread_mutex_t g_surface_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile bool g_running = true;
 
+/* ── cursor state ─────────────────────────────────────────────────────── */
+
+static IOSurfaceRef  g_cursor_surface;
+static int           g_cursor_x, g_cursor_y;
+static uint32_t      g_cursor_w, g_cursor_h;
+static pthread_mutex_t g_cursor_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /* ── signal handler ───────────────────────────────────────────────────── */
 
 static void handle_signal(int sig)
@@ -71,20 +78,32 @@ static void TimerCallback(CFRunLoopTimerRef timer, void *info)
     @autoreleasepool {
         if (!g_display || !g_display_surface) return;
 
+        /* ── Lock and retain client surface ──────────────────────────── */
         pthread_mutex_lock(&g_surface_lock);
         IOSurfaceRef client = g_client_surface;
         if (client) CFRetain(client);
         pthread_mutex_unlock(&g_surface_lock);
 
-        if (!client) return;
+        /* ── Lock cursor state ───────────────────────────────────────── */
+        pthread_mutex_lock(&g_cursor_lock);
+        IOSurfaceRef cursor = g_cursor_surface;
+        if (cursor) CFRetain(cursor);
+        int cx = g_cursor_x, cy = g_cursor_y;
+        uint32_t cw = g_cursor_w, ch = g_cursor_h;
+        pthread_mutex_unlock(&g_cursor_lock);
 
-        /* Blit client pixels into our display surface */
-        size_t cw = IOSurfaceGetWidth(client);
-        size_t ch = IOSurfaceGetHeight(client);
-        size_t dw = IOSurfaceGetWidth(g_display_surface);
-        size_t dh = IOSurfaceGetHeight(g_display_surface);
-        size_t copy_w = cw < dw ? cw : dw;
-        size_t copy_h = ch < dh ? ch : dh;
+        if (!client) {
+            if (cursor) CFRelease(cursor);
+            return;
+        }
+
+        /* ── Blit client pixels into display surface ─────────────────── */
+        size_t scw = IOSurfaceGetWidth(client);
+        size_t sch = IOSurfaceGetHeight(client);
+        size_t dw  = IOSurfaceGetWidth(g_display_surface);
+        size_t dh  = IOSurfaceGetHeight(g_display_surface);
+        size_t copy_w = scw < dw ? (size_t)scw : dw;
+        size_t copy_h = sch < dh ? (size_t)sch : dh;
 
         IOSurfaceLock(client, 0, NULL);
         IOSurfaceLock(g_display_surface, 0, NULL);
@@ -96,6 +115,47 @@ static void TimerCallback(CFRunLoopTimerRef timer, void *info)
 
         for (size_t y = 0; y < copy_h; y++)
             memcpy(dst_base + y * dst_stride, src_base + y * src_stride, copy_w * 4);
+
+        /* ── Blend cursor onto display surface ───────────────────────── */
+        if (cursor) {
+            IOSurfaceLock(cursor, 0, NULL);
+            uint8_t *cur_base = (uint8_t *)IOSurfaceGetBaseAddress(cursor);
+            size_t cur_stride = IOSurfaceGetBytesPerRow(cursor);
+
+            for (uint32_t y = 0; y < ch; y++) {
+                int dy = cy + (int)y;
+                if (dy < 0 || (size_t)dy >= dh) continue;
+                for (uint32_t x = 0; x < cw; x++) {
+                    int dx = cx + (int)x;
+                    if (dx < 0 || (size_t)dx >= dw) continue;
+
+                    uint32_t *cur_px = (uint32_t *)(cur_base + y * cur_stride + x * 4);
+                    uint32_t *dst_px = (uint32_t *)(dst_base + (size_t)dy * dst_stride + (size_t)dx * 4);
+
+                    uint32_t cp = *cur_px;
+                    uint32_t dp = *dst_px;
+
+                    uint8_t ca = (cp >> 24) & 0xFF;  /* ARGB -> A is MSB */
+                    if (ca == 0) continue;
+
+                    uint8_t cr = (cp >> 16) & 0xFF;
+                    uint8_t cg = (cp >> 8)  & 0xFF;
+                    uint8_t cb =  cp        & 0xFF;
+
+                    uint8_t dr = (dp >> 16) & 0xFF;
+                    uint8_t dg = (dp >> 8)  & 0xFF;
+                    uint8_t db =  dp        & 0xFF;
+
+                    uint8_t nr = (uint8_t)(((int)cr * ca + dr * (255 - ca)) / 255);
+                    uint8_t ng = (uint8_t)(((int)cg * ca + dg * (255 - ca)) / 255);
+                    uint8_t nb = (uint8_t)(((int)cb * ca + db * (255 - ca)) / 255);
+
+                    *dst_px = (uint32_t)nb | ((uint32_t)ng << 8) | ((uint32_t)nr << 16) | ((uint32_t)0xFF << 24);
+                }
+            }
+            IOSurfaceUnlock(cursor, 0, NULL);
+            CFRelease(cursor);
+        }
 
         IOSurfaceUnlock(g_display_surface, 0, NULL);
         IOSurfaceUnlock(client, 0, NULL);
@@ -153,13 +213,32 @@ static void *mach_server_thread(void *arg)
         msg.json[len] = '\0';
         printf("[framebufferd] %s\n", msg.json);
 
-        if (client_surface) {
-            /* Swap in the new client surface — the timer callback will
-               blit from it on the next tick */
+        /* Route message by operation type */
+        if (strstr(msg.json, "\"op\":\"cursor_set\"")) {
+            /* Cursor set — store the cursor surface + dimensions */
+            pthread_mutex_lock(&g_cursor_lock);
+            if (g_cursor_surface) CFRelease(g_cursor_surface);
+            g_cursor_surface = client_surface;
+            g_cursor_w = 64; g_cursor_h = 64;
+            /* Try to parse w/h from JSON */
+            sscanf(msg.json, "%*[^w]\"w\":%u,\"h\":%u",
+                   &g_cursor_w, &g_cursor_h);
+            pthread_mutex_unlock(&g_cursor_lock);
+        } else if (strstr(msg.json, "\"op\":\"cursor_move\"")) {
+            /* Cursor move — update position */
+            pthread_mutex_lock(&g_cursor_lock);
+            sscanf(msg.json, "%*[^x]\"x\":%d,\"y\":%d",
+                   &g_cursor_x, &g_cursor_y);
+            pthread_mutex_unlock(&g_cursor_lock);
+            if (client_surface) CFRelease(client_surface);
+        } else if (client_surface) {
+            /* Default: treat as page flip / surface update */
             pthread_mutex_lock(&g_surface_lock);
             if (g_client_surface) CFRelease(g_client_surface);
             g_client_surface = client_surface;
             pthread_mutex_unlock(&g_surface_lock);
+        } else {
+            if (client_surface) CFRelease(client_surface);
         }
     }
     return NULL;
