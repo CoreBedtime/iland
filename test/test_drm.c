@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 int main(void) {
     int fd, ret;
@@ -63,6 +64,19 @@ int main(void) {
     uint64_t offset;
     ret = drmModeMapDumbBuffer(fd, handle, &offset);
     printf("[test_drm]   offset=0x%llx\n", (unsigned long long)offset);
+
+    printf("[test_drm] writing test pattern\n");
+    uint32_t *pixels = (uint32_t *)(uintptr_t)offset;
+    for (int y = 0; y < 240; y++) {
+        for (int x = 0; x < 320; x++) {
+            uint8_t r = (uint8_t)(x * 255 / 319);
+            uint8_t g = (uint8_t)(y * 255 / 239);
+            uint8_t b = (uint8_t)((x + y) * 128 / 559);
+            pixels[y * (pitch/4) + x] = (uint32_t)r << 16
+                                       | (uint32_t)g << 8
+                                       | (uint32_t)b;
+        }
+    }
 
     printf("[test_drm] drmModeAddFB(320, 240, 32)\n");
     uint32_t fb_id;

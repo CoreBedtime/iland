@@ -1,7 +1,14 @@
-add_executable(framebufferd src/main.c)
-target_link_libraries(framebufferd PRIVATE drm)
+add_executable(framebufferd src/main.m src/DisplaySurface.m)
 
-add_custom_command(TARGET framebufferd POST_BUILD
-  COMMAND codesign -s - --entitlements ${CMAKE_CURRENT_SOURCE_DIR}/entitlements.plist -f $<TARGET_FILE:framebufferd>
-  COMMENT "Signing framebufferd with entitlements"
+target_include_directories(framebufferd PRIVATE
+  ${CMAKE_SOURCE_DIR}/shims/drm/drm/include
+)
+
+target_link_libraries(framebufferd PRIVATE
+  symrez
+  -lobjc
+  "-framework Foundation"
+  "-framework QuartzCore"
+  "-framework IOSurface"
+  "-framework CoreGraphics"
 )

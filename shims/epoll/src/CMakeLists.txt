@@ -89,7 +89,6 @@ set(_epoll_shim_sources
   epoll_shim_ctx.c
   epoll.c
   epollfd_ctx.c
-  hook.c
   kqueue_event.c
   signalfd.c
   signalfd_ctx.c

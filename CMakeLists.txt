@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(myland LANGUAGES C)
+project(myland LANGUAGES C OBJC)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_EXTENSIONS ON)
@@ -42,6 +42,9 @@ target_link_libraries(wayland-mac PRIVATE
 # Shim-specific headers (epoll, drm) are propagated transitively through
 # each library target's PUBLIC include directories.
 target_link_libraries(wayland-mac PUBLIC drm)
+target_include_directories(wayland-mac PRIVATE
+  ${CMAKE_SOURCE_DIR}/shims/epoll/src
+)
 target_include_directories(wayland-mac PUBLIC
   ${CMAKE_SOURCE_DIR}/shims
   $<TARGET_PROPERTY:epoll-shim-interpose,INTERFACE_INCLUDE_DIRECTORIES>
