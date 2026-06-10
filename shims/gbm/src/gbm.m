@@ -212,6 +212,17 @@ struct gbm_bo *gbm_bo_create_with_modifiers(struct gbm_device *gbm,
     return gbm_bo_create(gbm, width, height, format, 0);
 }
 
+struct gbm_bo *gbm_bo_create_with_modifiers2(struct gbm_device *gbm,
+                                              uint32_t width, uint32_t height,
+                                              uint32_t format,
+                                              const uint64_t *modifiers,
+                                              uint32_t count,
+                                              uint32_t flags)
+{
+    (void)modifiers;(void)count;(void)flags;
+    return gbm_bo_create(gbm, width, height, format, 0);
+}
+
 void gbm_bo_destroy(struct gbm_bo *bo)
 {
     if (!bo) return;

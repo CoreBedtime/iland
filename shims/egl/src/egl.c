@@ -119,6 +119,8 @@ EGLint eglGetError(void)
 
 const char *eglQueryString(EGLDisplay dpy, EGLint name)
 {
+    if (dpy == EGL_NO_DISPLAY) return NULL;
+    if (!real_eglQueryString) return NULL;
     EGLShimDisplay *sd = unwrap_display(dpy);
     if (!sd) return real_eglQueryString(dpy, name);
     return real_eglQueryString(sd->angle_display, name);

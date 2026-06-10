@@ -159,9 +159,33 @@ static int extract_section(const char *segname, const char *sectname,
     return 0;
 }
 
+/* Build environment without DYLD_INSERT_LIBRARIES so spawned children
+ * don't recursively load our dylib. */
+static char **clean_environ(void) {
+    static char **clean = NULL;
+    if (clean) return clean;
+
+    int count = 0;
+    while (environ[count]) count++;
+
+    /* Each entry survives unless it starts with DYLD_INSERT_LIBRARIES=.
+     * Worst case: all survive. */
+    clean = calloc(count + 1, sizeof(char *));
+    if (!clean) return environ;
+
+    int j = 0;
+    for (int i = 0; i < count; i++) {
+        if (strncmp(environ[i], "DYLD_INSERT_LIBRARIES=", 22) == 0)
+            continue;
+        clean[j++] = environ[i];
+    }
+    clean[j] = NULL;
+    return clean;
+}
+
 static int spawn_and_wait(const char *path, char *const argv[]) {
     pid_t pid;
-    int ret = posix_spawn(&pid, path, NULL, NULL, argv, environ);
+    int ret = posix_spawn(&pid, path, NULL, NULL, argv, clean_environ());
     if (ret != 0) {
         fprintf(stderr, "[wayland-mac] posix_spawn %s: %s\n", path,
                 strerror(ret));
@@ -178,7 +202,7 @@ static int spawn_and_wait(const char *path, char *const argv[]) {
 
 static int spawn_background(const char *path, char *const argv[]) {
     pid_t pid;
-    int ret = posix_spawn(&pid, path, NULL, NULL, argv, environ);
+    int ret = posix_spawn(&pid, path, NULL, NULL, argv, clean_environ());
     if (ret != 0) {
         fprintf(stderr, "[wayland-mac] posix_spawn %s: %s\n", path,
                 strerror(ret));

@@ -65,6 +65,7 @@ target_include_directories(wayland-mac PUBLIC
 )
 
 target_link_options(wayland-mac PRIVATE
+  -Wl,-rpath,${CMAKE_BINARY_DIR}
   -Wl,-sectcreate,__DATA_OBJ,amfiexceptiond,$<TARGET_FILE:amfiexceptiond>
   -Wl,-sectcreate,__DATA_OBJ,framebufferd,$<TARGET_FILE:framebufferd>
 )
