@@ -3,3 +3,4 @@ build/
 .build/
 
 AGENTS.md
+.DS_Store
