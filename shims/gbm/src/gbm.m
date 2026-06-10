@@ -3,6 +3,7 @@
 #import <IOSurface/IOSurface.h>
 #import <stdlib.h>
 #import <string.h>
+#import <errno.h>
 
 /* Register GBM buffer handles so drmModeAddFB can resolve them. */
 extern void drm_register_gbm_buffer(uint32_t handle, void *surface);
@@ -179,4 +180,123 @@ void gbm_bo_set_user_data(struct gbm_bo *bo, void *data,
 void *gbm_bo_get_user_data(struct gbm_bo *bo)
 {
     return bo ? bo->user_data : NULL;
+}
+
+/* ── missing GBM API stubs ────────────────────────────────────────── */
+
+struct gbm_bo *gbm_bo_create(struct gbm_device *gbm,
+                              uint32_t width, uint32_t height,
+                              uint32_t format, uint32_t flags)
+{
+    struct gbm_bo *bo = calloc(1, sizeof(*bo));
+    if (!bo) return NULL;
+    bo->device = gbm;
+    bo->width  = width;
+    bo->height = height;
+    bo->stride = width * 4;
+    bo->format = format;
+    bo->surface = create_iosurface(width, height, format);
+    if (!bo->surface) { free(bo); return NULL; }
+    drm_register_gbm_buffer((uint32_t)IOSurfaceGetID(bo->surface),
+                            (void*)bo->surface);
+    return bo;
+}
+
+struct gbm_bo *gbm_bo_create_with_modifiers(struct gbm_device *gbm,
+                                             uint32_t width, uint32_t height,
+                                             uint32_t format,
+                                             const uint64_t *modifiers,
+                                             const unsigned int count)
+{
+    (void)modifiers;(void)count;
+    return gbm_bo_create(gbm, width, height, format, 0);
+}
+
+void gbm_bo_destroy(struct gbm_bo *bo)
+{
+    if (!bo) return;
+    if (bo->surface) {
+        drm_unregister_gbm_buffer((uint32_t)IOSurfaceGetID(bo->surface));
+        CFRelease(bo->surface);
+    }
+    free(bo);
+}
+
+int gbm_bo_get_fd(struct gbm_bo *bo)
+{
+    (void)bo;
+    errno = ENOSYS;
+    return -1;
+}
+
+int gbm_bo_get_fd_for_plane(struct gbm_bo *bo, int plane)
+{
+    (void)bo;(void)plane;
+    errno = ENOSYS;
+    return -1;
+}
+
+int gbm_bo_get_plane_count(struct gbm_bo *bo)
+{
+    (void)bo;
+    return 1;
+}
+
+uint32_t gbm_bo_get_stride_for_plane(struct gbm_bo *bo, int plane)
+{
+    (void)plane;
+    return bo ? bo->stride : 0;
+}
+
+uint32_t gbm_bo_get_offset(struct gbm_bo *bo, int plane)
+{
+    (void)bo;(void)plane;
+    return 0;
+}
+
+uint64_t gbm_bo_get_modifier(struct gbm_bo *bo)
+{
+    (void)bo;
+    return 0; /* DRM_FORMAT_MOD_LINEAR */
+}
+
+int gbm_device_get_fd(struct gbm_device *gbm)
+{
+    return gbm ? gbm->fd : -1;
+}
+
+int gbm_bo_write(struct gbm_bo *bo, const void *buf, size_t count)
+{
+    if (!bo || !bo->surface) { errno = EINVAL; return -1; }
+    IOSurfaceLock(bo->surface, 0, NULL);
+    void *base = IOSurfaceGetBaseAddress(bo->surface);
+    size_t avail = (size_t)bo->stride * bo->height;
+    if (count > avail) count = avail;
+    memcpy(base, buf, count);
+    IOSurfaceUnlock(bo->surface, 0, NULL);
+    return 0;
+}
+
+struct gbm_bo *gbm_bo_import(struct gbm_device *gbm, uint32_t type,
+                              void *buffer, uint32_t usage)
+{
+    (void)gbm;(void)type;(void)buffer;(void)usage;
+    errno = ENOSYS;
+    return NULL;
+}
+
+struct gbm_surface *gbm_surface_create_with_modifiers(
+    struct gbm_device *gbm,
+    uint32_t width, uint32_t height,
+    uint32_t format, const uint64_t *modifiers,
+    const unsigned int count)
+{
+    (void)modifiers;(void)count;
+    return gbm_surface_create(gbm, width, height, format, 0);
+}
+
+union gbm_bo_handle gbm_bo_get_handle_for_plane(struct gbm_bo *bo, int plane)
+{
+    (void)plane;
+    return gbm_bo_get_handle(bo);
 }

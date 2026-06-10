@@ -387,6 +387,33 @@ int               drmModeAtomicCommit(int fd, drmModeAtomicReq *req, uint32_t fl
 int drmModeSetCursor(int fd, uint32_t crtc_id, uint32_t bo_handle, uint32_t width, uint32_t height);
 int drmModeMoveCursor(int fd, uint32_t crtc_id, int x, int y);
 
+/* ── VBlank ───────────────────────────────────────────────────────────── */
+
+typedef struct drmVBlankReq {
+    uint32_t type;
+    uint32_t sequence;
+    uint64_t signal;
+} drmVBlankReq;
+
+typedef struct drmVBlankReply {
+    uint32_t type;
+    uint32_t sequence;
+    uint32_t tval_sec;
+    uint32_t tval_usec;
+} drmVBlankReply;
+
+typedef struct drmVBlank {
+    drmVBlankReq request;
+    drmVBlankReply reply;
+} drmVBlank;
+
+/* ── format modifier blob iterator ───────────────────────────────────── */
+
+typedef struct _drmModeFormatModifierIterator {
+    uint32_t fmt_idx;
+    uint32_t mod_idx;
+} drmModeFormatModifierIterator;
+
 /* ── sync objects ─────────────────────────────────────────────────────── */
 
 int drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle);

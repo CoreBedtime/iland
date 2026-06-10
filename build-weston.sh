@@ -261,7 +261,7 @@ cat > "$STUB_INCDIR/linux/input.h" << 'EOF'
 #endif
 EOF
 
-# ---- macOS compat stubs for Linux-only symbols that meson detects via has_function() ---- 
+# ---- macOS compat stubs for Linux-only symbols that meson detects via has_function() ----
 cat > "$STUB_INCDIR/_macos_stubs.h" << 'EOF'
 #ifndef _MACOS_STUBS_H
 #define _MACOS_STUBS_H
@@ -276,45 +276,11 @@ cat > "$STUB_INCDIR/_macos_stubs.h" << 'EOF'
 #include <string.h>
 #include <sys/param.h>
 #include <sys/ioctl.h>
+#include <glibc-compat.h>
 
 /* macOS howmany uses modulo which fails with double operands; override */
 #undef howmany
 #define howmany(x, y) (((x) + ((y) - 1)) / (y))
-
-/* funopen may be hidden by _POSIX_C_SOURCE; declare it manually */
-FILE *funopen(const void *cookie,
-              int (*readfn)(void *, char *, int),
-              int (*writefn)(void *, const char *, int),
-              fpos_t (*seekfn)(void *, fpos_t, int),
-              int (*closefn)(void *));
-
-/* fopencookie (GNU) -> funopen (BSD/macOS) wrapper */
-typedef struct {
-    ssize_t (*read)(void *, char *, size_t);
-    ssize_t (*write)(void *, const char *, size_t);
-    int (*seek)(void *, fpos_t *, int);
-    int (*close)(void *);
-} cookie_io_functions_t;
-
-static inline int _fopencookie_write(void *cookie, const char *buf, int size) {
-    cookie_io_functions_t *f = (cookie_io_functions_t *)(((void **)cookie) + 1);
-    return (int)f->write(cookie, buf, (size_t)size);
-}
-static inline int _fopencookie_close(void *cookie) {
-    cookie_io_functions_t *f = (cookie_io_functions_t *)(((void **)cookie) + 1);
-    return f->close(cookie);
-}
-static inline FILE *fopencookie(void *cookie, const char *mode,
-                                 cookie_io_functions_t io_funcs) {
-    (void)mode;
-    /* funopen on macOS: read/write return int, take int size.
-     * We pack the cookie + io_funcs into a simple struct. */
-    void **wrapper = malloc(2 * sizeof(void *));
-    if (!wrapper) return NULL;
-    wrapper[0] = cookie;
-    memcpy(wrapper + 1, &io_funcs, sizeof(io_funcs));
-    return funopen(wrapper, NULL, _fopencookie_write, NULL, _fopencookie_close);
-}
 /* struct itimerspec is Linux-only; macOS has <time.h> with struct timespec */
 #ifndef _STRUCT_ITIMERSPEC
 #define _STRUCT_ITIMERSPEC
@@ -906,14 +872,15 @@ meson setup "$BUILD_DIR" "$WESTON_DIR" --reconfigure \
     -Dresize-pool=false \
     -Dsystemd=false \
     -Db_lundef=false \
-    -Dc_args="$CFLAGS -I${SCRIPT_DIR}/shims/gbm/include -I${SCRIPT_DIR}/build/shims/epoll/install-include -Dprogram_invocation_short_name=getprogname() $FORCE_INCLUDE" \
+    -Dc_args="$CFLAGS -I${SCRIPT_DIR}/shims/gbm/include -I${SCRIPT_DIR}/shims/glibc/include -I${SCRIPT_DIR}/build/shims/epoll/install-include -Dprogram_invocation_short_name=getprogname() $FORCE_INCLUDE" \
     -Dc_link_args="$LDFLAGS" \
     2>&1 | tee "$BUILD_DIR/meson-setup.log"
 
 echo "=== Building weston ==="
-meson compile -C "$BUILD_DIR" 2>&1 | tee "$BUILD_DIR/meson-build.log"
+JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+meson compile -C "$BUILD_DIR" -j "$JOBS" 2>&1 | tee "$BUILD_DIR/meson-build.log"
 
 echo ""
 echo "=== Done ==="
 echo "Binaries in: $BUILD_DIR"
-echo "Run: DYLD_INSERT_LIBRARIES=$SHIM_DYLIB $BUILD_DIR/weston"
+echo "Run: sudo build-weston/frontend/weston"

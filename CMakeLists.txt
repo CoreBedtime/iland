@@ -30,6 +30,8 @@ set_target_properties(epoll-shim-interpose PROPERTIES
 add_subdirectory(shims/drm)
 add_subdirectory(shims/gbm)
 add_subdirectory(shims/egl)
+add_subdirectory(shims/glibc)
+add_subdirectory(shims/wayland)
 
 # --- Output dylib: absorbs all shims, embeds amfiexceptiond + framebufferd ---
 add_library(wayland-mac SHARED shims/wayland-mac.c)
@@ -37,6 +39,8 @@ add_library(wayland-mac SHARED shims/wayland-mac.c)
 target_link_libraries(wayland-mac PRIVATE
   -Wl,-force_load,$<TARGET_FILE:dobby>
   -Wl,-force_load,$<TARGET_FILE:epoll-shim-interpose>
+  -Wl,-force_load,$<TARGET_FILE:glibc-compat>
+  -Wl,-force_load,$<TARGET_FILE:wayland>
   -Wl,-force_load,$<TARGET_FILE:drm>
   -Wl,-force_load,$<TARGET_FILE:gbm>
   -Wl,-force_load,$<TARGET_FILE:egl-shim>
@@ -54,6 +58,7 @@ target_include_directories(wayland-mac PUBLIC
   ${CMAKE_SOURCE_DIR}/shims
   ${CMAKE_SOURCE_DIR}/shims/include
   ${CMAKE_SOURCE_DIR}/shims/gbm/include
+  ${CMAKE_SOURCE_DIR}/shims/glibc/include
   $<TARGET_PROPERTY:epoll-shim-interpose,INTERFACE_INCLUDE_DIRECTORIES>
 )
 
@@ -68,6 +73,8 @@ add_dependencies(wayland-mac
   drm
   gbm
   egl-shim
+  glibc-compat
+  wayland
   amfiexceptiond
   framebufferd
 )

@@ -1437,6 +1437,64 @@ drmGetFormatModifierName(uint64_t modifier)
     return NULL;
 }
 
+int
+drmCloseBufferHandle(int fd, int handle)
+{
+    if (check_fd(fd) < 0) return -1;
+    (void)handle;
+    return 0;
+}
+
+int
+drmModeConnectorSetProperty(int fd, uint32_t connector_id,
+                            uint32_t property_id, uint64_t value)
+{
+    if (check_fd(fd) < 0) return -1;
+    (void)connector_id;(void)property_id;(void)value;
+    return 0;
+}
+
+int
+drmModeCrtcSetGamma(int fd, uint32_t crtc_id, uint32_t size,
+                    uint16_t *red, uint16_t *green, uint16_t *blue)
+{
+    if (check_fd(fd) < 0) return -1;
+    (void)crtc_id;(void)size;(void)red;(void)green;(void)blue;
+    return 0;
+}
+
+int
+drmModeSetPlane(int fd, uint32_t plane_id, uint32_t crtc_id,
+                uint32_t fb_id, uint32_t flags,
+                int32_t crtc_x, int32_t crtc_y,
+                uint32_t crtc_w, uint32_t crtc_h,
+                uint32_t src_x, uint32_t src_y,
+                uint32_t src_w, uint32_t src_h)
+{
+    if (check_fd(fd) < 0) return -1;
+    (void)plane_id;(void)crtc_id;(void)fb_id;(void)flags;
+    (void)crtc_x;(void)crtc_y;(void)crtc_w;(void)crtc_h;
+    (void)src_x;(void)src_y;(void)src_w;(void)src_h;
+    return 0;
+}
+
+int
+drmWaitVBlank(int fd, drmVBlank *vbl)
+{
+    if (check_fd(fd) < 0) return -1;
+    (void)vbl;
+    return 0;
+}
+
+bool
+drmModeFormatModifierBlobIterNext(const drmModePropertyBlobRes *blob,
+                                  drmModeFormatModifierIterator *iter)
+{
+    (void)blob;
+    (void)iter;
+    return false;
+}
+
 const char *
 drmGetFormatModifierVendor(uint64_t modifier)
 {
