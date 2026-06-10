@@ -4,6 +4,8 @@
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 
+#define ESUTIL_API
+
 #ifdef __cplusplus
 extern "C" {
 #endif

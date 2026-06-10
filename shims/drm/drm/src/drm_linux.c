@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <mach/mach.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 /* ── static mode table ────────────────────────────────────────────────── */
@@ -46,6 +47,15 @@ static struct {
     drmModeModeInfo crtc_mode;
     int             crtc_mode_valid;
 } g_state;
+
+/* DRM event pipe — written by drmModePageFlip, read by drmHandleEvent.
+ * wayland-mac.c dup2's a real pipe to fd DRM_VIRTUAL_FD at startup so
+ * select/poll work natively on the virtual fd.  -1 = not initialised. */
+int g_drm_event_pipe_write = -1;
+
+/* Pending page-flip user_data — drmModePageFlip stores it, drmHandleEvent
+ * passes it to the event handler.  Only one outstanding flip at a time. */
+static void *g_pending_flip_data = NULL;
 
 /* ── helpers ──────────────────────────────────────────────────────────── */
 
@@ -538,19 +548,46 @@ int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id,
              "{\"op\":\"page_flip\",\"crtc\":%u,\"fb\":%u,\"flags\":%u}",
              crtc_id, fb_id, flags);
 
+    g_pending_flip_data = user_data;
+
     int ret = drm_send_json_with_surface(buf, surface_port);
 
     if (surface_port != MACH_PORT_NULL)
         mach_port_deallocate(mach_task_self(), surface_port);
 
-    (void)user_data;
+    /* Signal page flip completion immediately (TODO: real vsync) */
+    if (ret == 0 && g_drm_event_pipe_write >= 0) {
+        char byte = 1;
+        ssize_t w = write(g_drm_event_pipe_write, &byte, 1);
+        (void)w;
+    }
+
     return ret;
 }
 
 int drmHandleEvent(int fd, drmEventContextPtr evctx)
 {
-    (void)fd; (void)evctx;
-    return 0;
+    if (fd != DRM_VIRTUAL_FD) { errno = EBADF; return -1; }
+
+    /* Read one event byte from the pipe */
+    char byte;
+    ssize_t n = read(fd, &byte, 1);
+    if (n <= 0) {
+        if (n == 0) errno = EAGAIN;
+        return -1;
+    }
+
+    if (byte == 1 && evctx && evctx->page_flip_handler) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        void *data = g_pending_flip_data;
+        g_pending_flip_data = NULL;
+        evctx->page_flip_handler(fd, 0,
+                                  (unsigned int)tv.tv_sec,
+                                  (unsigned int)tv.tv_usec,
+                                  data);
+    }
+    return 1;
 }
 
 /* ── generic ioctl ────────────────────────────────────────────────────── */

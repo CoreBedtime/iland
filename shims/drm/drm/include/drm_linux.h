@@ -13,6 +13,11 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Pipe write end for DRM event signaling.  drmModePageFlip writes a byte
+ * here after sending the IPC, making virtual fd 42 readable by select/poll.
+ * Initialised by wayland-mac.c before any DRM open.  -1 = not ready.    */
+extern int g_drm_event_pipe_write;
+
 #ifdef __cplusplus
 extern "C" {
 #endif

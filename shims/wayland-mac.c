@@ -214,6 +214,20 @@ static void wayland_mac_load(void) {
         return;
     }
 
+    /* Create a real pipe dup'd to DRM_VIRTUAL_FD so select/poll work on
+     * our virtual DRM fd.  The read end becomes fd 42; the write end is
+     * stored for drmModePageFlip to signal page-flip completion events. */
+    {
+        int p[2];
+        if (pipe(p) == 0) {
+            dup2(p[0], DRM_VIRTUAL_FD);
+            close(p[0]);
+            /* Declared in drm_linux.h, defined in drm_linux.c */
+            extern int g_drm_event_pipe_write;
+            g_drm_event_pipe_write = p[1];
+        }
+    }
+
     /* Install hooks before anything else — these intercept libc calls
      * (read, write, poll, close, fcntl) and route them through the
      * epoll shim.  Future DRM hooks go here too. */
