@@ -28,6 +28,8 @@ set_target_properties(epoll-shim-interpose PROPERTIES
   C_VISIBILITY_PRESET "default"
 )
 add_subdirectory(shims/drm)
+add_subdirectory(shims/gbm)
+add_subdirectory(shims/egl)
 
 # --- Output dylib: absorbs all shims, embeds amfiexceptiond + framebufferd ---
 add_library(wayland-mac SHARED shims/wayland-mac.c)
@@ -36,17 +38,22 @@ target_link_libraries(wayland-mac PRIVATE
   -Wl,-force_load,$<TARGET_FILE:dobby>
   -Wl,-force_load,$<TARGET_FILE:epoll-shim-interpose>
   -Wl,-force_load,$<TARGET_FILE:drm>
+  -Wl,-force_load,$<TARGET_FILE:gbm>
+  -Wl,-force_load,$<TARGET_FILE:egl-shim>
 )
 
 # Expose all shim APIs via the single umbrella header <wayland-mac.h>.
 # Shim-specific headers (epoll, drm) are propagated transitively through
 # each library target's PUBLIC include directories.
-target_link_libraries(wayland-mac PUBLIC drm)
+target_link_libraries(wayland-mac PUBLIC drm gbm egl-shim)
+target_link_libraries(wayland-mac PRIVATE "-framework Foundation" "-lobjc")
 target_include_directories(wayland-mac PRIVATE
   ${CMAKE_SOURCE_DIR}/shims/epoll/src
 )
 target_include_directories(wayland-mac PUBLIC
   ${CMAKE_SOURCE_DIR}/shims
+  ${CMAKE_SOURCE_DIR}/shims/include
+  ${CMAKE_SOURCE_DIR}/shims/gbm/include
   $<TARGET_PROPERTY:epoll-shim-interpose,INTERFACE_INCLUDE_DIRECTORIES>
 )
 
@@ -59,6 +66,8 @@ add_dependencies(wayland-mac
   epoll-shim-interpose
   dobby
   drm
+  gbm
+  egl-shim
   amfiexceptiond
   framebufferd
 )

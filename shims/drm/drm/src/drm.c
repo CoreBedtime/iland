@@ -20,6 +20,12 @@ static int send_msg(drm_ipc_msg_t *msg, size_t msg_size)
     msg->header.msgh_remote_port = port;
     msg->header.msgh_size        = msg_size;
 
+    fprintf(stderr, "[drm] send: msg_size=%zu sizeof_all=%zu hdr=%zu body=%zu desc=%zu jlen=%zu complex=%d\n",
+            msg_size, sizeof(drm_ipc_msg_t), sizeof(msg->header),
+            sizeof(msg->body), sizeof(msg->surface_port),
+            sizeof(msg->json_len),
+            !!(msg->header.msgh_bits & MACH_MSGH_BITS_COMPLEX));
+
     kr = mach_msg(&msg->header,
                   MACH_SEND_MSG,
                   msg_size,
@@ -57,9 +63,12 @@ int drm_send_json(const char *json)
     msg.json_len = (uint32_t)len;
     memcpy(msg.json, json, len);
 
-    size_t msg_size = sizeof(msg.header) + sizeof(msg.body)
-                    + sizeof(msg.surface_port)
-                    + sizeof(msg.json_len) + len;
+    /* Compute message size as fixed struct prefix up to (but not including)
+     * the json array, plus the actual json data.  Using sizeof captures
+     * any compiler-inserted padding between struct fields; manually
+     * summing individual field sizes may undercount if new fields or
+     * alignment padding is added. */
+    size_t msg_size = sizeof(drm_ipc_msg_t) - DRM_IPC_JSON_MAX + len;
     return send_msg(&msg, msg_size);
 }
 
@@ -92,8 +101,6 @@ int drm_send_json_with_surface(const char *json, mach_port_t surface_port)
     msg.json_len = (uint32_t)len;
     memcpy(msg.json, json, len);
 
-    size_t msg_size = sizeof(msg.header) + sizeof(msg.body)
-                    + sizeof(msg.surface_port)
-                    + sizeof(msg.json_len) + len;
+    size_t msg_size = sizeof(drm_ipc_msg_t) - DRM_IPC_JSON_MAX + len;
     return send_msg(&msg, msg_size);
 }
