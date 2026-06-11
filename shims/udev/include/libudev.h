@@ -55,6 +55,7 @@ struct udev_enumerate *udev_enumerate_unref(struct udev_enumerate *);
 struct udev_list_entry *udev_enumerate_get_list_entry(struct udev_enumerate *);
 struct udev_list_entry *udev_list_entry_get_next(struct udev_list_entry *);
 const char *udev_list_entry_get_name(struct udev_list_entry *);
+#define udev_list_entry_foreach(e, list) for (e = list; e; e = udev_list_entry_get_next(e))
 struct udev_monitor *udev_monitor_new_from_netlink(struct udev *, const char *);
 int udev_monitor_filter_add_match_subsystem_devtype(struct udev_monitor *, const char *, const char *);
 int udev_monitor_enable_receiving(struct udev_monitor *);

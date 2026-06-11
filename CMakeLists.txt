@@ -32,9 +32,10 @@ add_subdirectory(shims/gbm)
 add_subdirectory(shims/egl)
 add_subdirectory(shims/glibc)
 add_subdirectory(shims/wayland)
+add_subdirectory(shims/libinput)
 add_subdirectory(shims/udev)
 
-# --- Output dylib: absorbs all shims, embeds amfiexceptiond + framebufferd ---
+# --- Output dylib: absorbs all shims, embeds amfiexceptiond + framebufferd + inputd ---
 add_library(wayland-mac SHARED shims/wayland-mac.c)
 
 target_link_libraries(wayland-mac PRIVATE
@@ -46,6 +47,7 @@ target_link_libraries(wayland-mac PRIVATE
   -Wl,-force_load,$<TARGET_FILE:gbm>
   -Wl,-force_load,$<TARGET_FILE:egl-shim>
   -Wl,-force_load,$<TARGET_FILE:udev>
+  -Wl,-force_load,$<TARGET_FILE:libinput>
 )
 
 # Expose all shim APIs via the single umbrella header <wayland-mac.h>.
@@ -68,6 +70,7 @@ target_link_options(wayland-mac PRIVATE
   -Wl,-rpath,${CMAKE_BINARY_DIR}
   -Wl,-sectcreate,__DATA_OBJ,amfiexceptiond,$<TARGET_FILE:amfiexceptiond>
   -Wl,-sectcreate,__DATA_OBJ,framebufferd,$<TARGET_FILE:framebufferd>
+  -Wl,-sectcreate,__DATA_OBJ,inputd,$<TARGET_FILE:inputd>
 )
 
 add_dependencies(wayland-mac
@@ -81,6 +84,8 @@ add_dependencies(wayland-mac
   udev
   amfiexceptiond
   framebufferd
+  libinput
+  inputd
 )
 
 add_subdirectory(test)
