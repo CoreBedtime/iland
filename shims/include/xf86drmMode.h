@@ -87,6 +87,7 @@ typedef struct drmModeEncoder {
 
 #define DRM_MODE_TYPE_USERDEF       0x00000020
 #define DRM_MODE_TYPE_PREFERRED     0x00000040
+#define DRM_MODE_TYPE_DRIVER         0x00000080
 
 #define DRM_MODE_FLAG_PHSYNC        0x00000001
 #define DRM_MODE_FLAG_NHSYNC        0x00000002

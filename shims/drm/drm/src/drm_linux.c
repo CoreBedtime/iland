@@ -32,7 +32,7 @@ static const drmModeModeInfo g_modes[] = {
         .hdisplay     = 1280, .hsync_start = 1390,
         .hsync_end    = 1430, .htotal      = 1650, .hskew = 0,
         .vdisplay     = 720,  .vsync_start = 725,
-        .vsync_end    = 730,  .vtotal      = 750,  .vscan = 0,
+        .vsync_end    = 730, .vtotal       = 750, .vscan = 0,
         .vrefresh     = 60,
         .flags        = 0,
         .type         = 0,

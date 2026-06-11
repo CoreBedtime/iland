@@ -9,6 +9,9 @@ WESTON_MODULE_MAP="${WESTON_MODULE_MAP};gl-renderer.so=${BUILD_DIR}/libweston/re
 WESTON_MODULE_MAP="${WESTON_MODULE_MAP};desktop-shell.so=${BUILD_DIR}/desktop-shell/desktop-shell.dylib"
 WESTON_MODULE_MAP="${WESTON_MODULE_MAP};weston-keyboard=${BUILD_DIR}/clients/weston-keyboard"
 WESTON_MODULE_MAP="${WESTON_MODULE_MAP};weston-desktop-shell=${BUILD_DIR}/clients/weston-desktop-shell"
+WESTON_MODULE_MAP="${WESTON_MODULE_MAP};weston-terminal=${BUILD_DIR}/clients/weston-terminal"
+
+WESTON_DATA_DIR="/Volumes/Bedtime/Developer/myland/weston/data"
 
 # XDG_RUNTIME_DIR for Wayland socket
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/weston-runtime}"
@@ -19,5 +22,6 @@ sudo env \
     DYLD_INSERT_LIBRARIES="$DYLD_INSERT_LIBRARIES" \
     WESTON_MODULE_MAP="$WESTON_MODULE_MAP" \
     XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+    WESTON_DATA_DIR="$WESTON_DATA_DIR" \
     "$BUILD_DIR/frontend/weston" --backend=drm \
     --config=/Volumes/Bedtime/Developer/myland/weston.ini

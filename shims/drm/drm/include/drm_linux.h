@@ -165,6 +165,11 @@ typedef struct drmEventContext {
 #define DRM_MODE_PAGE_FLIP_EVENT 0x01
 #define DRM_MODE_PAGE_FLIP_ASYNC 0x02
 
+/* ── mode type flags ────────────────────────────────────────────────────── */
+
+#define DRM_MODE_TYPE_PREFERRED  0x00000040
+#define DRM_MODE_TYPE_DRIVER     0x00000080
+
 /* ── prime ────────────────────────────────────────────────────────────── */
 
 #define DRM_CLOEXEC  0x80000000

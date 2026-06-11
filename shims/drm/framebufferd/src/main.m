@@ -1,8 +1,13 @@
 #include "drm_ipc.h"
 #include "DisplaySurface.h"
 
+#include <IOKit/IOKitLib.h>
+#include <IOKit/graphics/IOGraphicsTypes.h>  // has all the structs + SInt32 IOIndex
+
+
 #include <bootstrap.h>
 #include <mach/mach.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -244,6 +249,57 @@ static void *mach_server_thread(void *arg)
     return NULL;
 }
 
+bool get_display_resolution(uint32_t *w, uint32_t *h) {
+    // Resolve SPI via dyld — IOGraphicsLib is part of IOKit.framework
+    typedef kern_return_t (*GetModeDepth_t)(io_connect_t, IODisplayModeID *, IOIndex *);
+    typedef kern_return_t (*GetModeInfo_t)(io_connect_t, IODisplayModeID, IOFBDisplayModeDescription *);
+
+    GetModeDepth_t fn_getMode = dlsym(RTLD_DEFAULT, "IOFBGetCurrentDisplayModeAndDepth");
+    GetModeInfo_t  fn_getInfo = dlsym(RTLD_DEFAULT, "IOFBGetDisplayModeInformation");
+
+    if (!fn_getMode || !fn_getInfo) {
+        fprintf(stderr, "[framebufferd] IOFBGet* symbols not found\n");
+        return false;
+    }
+
+    io_iterator_t iter = IO_OBJECT_NULL;
+    io_service_t  fb   = IO_OBJECT_NULL;
+    bool          ok   = false;
+
+    if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                                     IOServiceMatching("IOFramebuffer"),
+                                     &iter) != KERN_SUCCESS)
+        return false;
+
+    while ((fb = IOIteratorNext(iter)) != IO_OBJECT_NULL) {
+        io_connect_t connect = IO_OBJECT_NULL;
+        if (IOServiceOpen(fb, mach_task_self(),
+                          kIOFBServerConnectType,
+                          &connect) != KERN_SUCCESS) {
+            IOObjectRelease(fb);
+            continue;
+        }
+
+        IODisplayModeID mode  = 0;
+        IOIndex         depth = 0;
+        if (fn_getMode(connect, &mode, &depth) == KERN_SUCCESS) {
+            IOFBDisplayModeDescription desc = {};
+            if (fn_getInfo(connect, mode, &desc) == KERN_SUCCESS) {
+                *w = desc.timingInfo.detailedInfo.v2.horizontalActive;
+                *h = desc.timingInfo.detailedInfo.v2.verticalActive;
+                ok = (*w > 0 && *h > 0);
+            }
+        }
+
+        IOServiceClose(connect);
+        IOObjectRelease(fb);
+        if (ok) break;
+    }
+
+    IOObjectRelease(iter);
+    return ok;
+}
+
 /* ── main ─────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -362,11 +418,24 @@ int main(void)
                g_display ? "yes" : "no");
 
         /* ── Create our own display surface ─────────────────────────── */
-        CGRect bounds = [g_display bounds];
-        uint32_t dw = (uint32_t)CGRectGetWidth(bounds);
-        uint32_t dh = (uint32_t)CGRectGetHeight(bounds);
-        if (dw < 1) dw = 1920;
-        if (dh < 1) dh = 1080;
+        // CGRect bounds = CGRectZero;
+        // for (int i = 0; i < 50 && CGRectGetWidth(bounds) < 1; i++) {
+        //     bounds = [g_display bounds];
+        //     if (CGRectGetWidth(bounds) < 1) usleep(100000);
+        // }
+        // uint32_t dw = (uint32_t)CGRectGetWidth(bounds);
+        // uint32_t dh = (uint32_t)CGRectGetHeight(bounds);
+        // if (dw < 1) dw = 1920;
+        // if (dh < 1) dh = 1080;
+        //
+        //
+
+        uint32_t dw = 0, dh = 0;
+        if (!get_display_resolution(&dw, &dh)) {
+            fprintf(stderr, "[framebufferd] IOFramebuffer resolution query failed, "
+                            "falling back to 1920x1080\n");
+            dw = 1920; dh = 1080;
+        }
 
         DisplaySurfaceInfo dsi = DisplaySurface_create(dw, dh, kWSPixelFormatBGRA);
         g_display_surface = dsi.surface;
