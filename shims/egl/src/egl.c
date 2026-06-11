@@ -309,9 +309,6 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface)
     EGLShimSurface *ss = unwrap_surface(surface);
     if (!ss) return real_eglSwapBuffers(dpy, surface);
 
-    EGLBoolean ret = real_eglSwapBuffers(sd->angle_display, ss->angle_surface);
-    if (!ret) return ret;
-
     struct gbm_surface *gs = ss->gbm_surface;
     struct gbm_bo *bo = gbm_surface_get_write_bo(gs);
     IOSurfaceRef iosurf = gbm_bo_get_iosurface(bo);
@@ -325,7 +322,11 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface)
     if (!pixels) return EGL_TRUE;
     if (!g_glReadPixels) { free(pixels); return EGL_TRUE; }
 
+    /* Read pixels BEFORE swap — back buffer content is undefined after */
     g_glReadPixels(0, 0, (int)w, (int)h, 0x1908, 0x1401, pixels);
+
+    EGLBoolean ret = real_eglSwapBuffers(sd->angle_display, ss->angle_surface);
+    if (!ret) { free(pixels); return ret; }
 
     IOSurfaceLock(iosurf, 0, NULL);
     void *base = IOSurfaceGetBaseAddress(iosurf);
