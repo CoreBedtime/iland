@@ -3,9 +3,10 @@
 # Run weston with terminal on macOS via our DRM/GBM/EGL shims.
 #
 
-BUILD_DIR="/Volumes/Bedtime/Developer/myland/build-weston"
-DYLD_INSERT_LIBRARIES="/Volumes/Bedtime/Developer/myland/build/libwayland-mac.dylib"
-WESTON_DATA_DIR="/Volumes/Bedtime/Developer/myland/weston/data"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUILD_DIR="$SCRIPT_DIR/build-weston"
+DYLD_INSERT_LIBRARIES="$SCRIPT_DIR/build/libwayland-mac.dylib"
+WESTON_DATA_DIR="$SCRIPT_DIR/weston/data"
 
 WESTON_MODULE_MAP="drm-backend.so=${BUILD_DIR}/libweston/backend-drm/drm-backend.dylib"
 WESTON_MODULE_MAP="${WESTON_MODULE_MAP};gl-renderer.so=${BUILD_DIR}/libweston/renderer-gl/gl-renderer.dylib"
@@ -33,7 +34,7 @@ sudo env \
     WESTON_DATA_DIR="$WESTON_DATA_DIR" \
     "$BUILD_DIR/frontend/weston" --backend=drm \
     --continue-without-input \
-    --config=/Volumes/Bedtime/Developer/myland/weston.ini &
+    --config="$SCRIPT_DIR/weston.ini" &
 
 WESTON_PID=$!
 
@@ -51,7 +52,7 @@ sudo env \
             WESTON_DATA_DIR="$WESTON_DATA_DIR" \
             XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
             WAYLAND_DISPLAY="$DNAME" \
-            "$BUILD_DIR/clients/weston-terminal" --shell=/Volumes/Bedtime/Developer/myland/weston/data/terminal-wrapper.sh \
+            "$BUILD_DIR/clients/weston-terminal" --shell="$SCRIPT_DIR/run/terminal-wrapper.sh" \
             2>/tmp/weston-terminal-err.log &
         TERMINAL_PID=$!
         echo "Terminal PID: $TERMINAL_PID"
