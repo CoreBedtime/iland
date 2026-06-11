@@ -578,15 +578,24 @@ int drmHandleEvent(int fd, drmEventContextPtr evctx)
         return -1;
     }
 
-    if (byte == 1 && evctx && evctx->page_flip_handler) {
+    if (byte == 1 && evctx) {
         struct timeval tv;
         gettimeofday(&tv, NULL);
         void *data = g_pending_flip_data;
         g_pending_flip_data = NULL;
-        evctx->page_flip_handler(fd, 0,
-                                  (unsigned int)tv.tv_sec,
-                                  (unsigned int)tv.tv_usec,
-                                  data);
+        /* page_flip_handler2 (v2+) provides CRTC ID required for atomic mode */
+        if (evctx->version >= 2 && evctx->page_flip_handler2) {
+            evctx->page_flip_handler2(fd, 0,
+                                      (unsigned int)tv.tv_sec,
+                                      (unsigned int)tv.tv_usec,
+                                      1 /* crtc_id */,
+                                      data);
+        } else if (evctx->page_flip_handler) {
+            evctx->page_flip_handler(fd, 0,
+                                      (unsigned int)tv.tv_sec,
+                                      (unsigned int)tv.tv_usec,
+                                      data);
+        }
     }
     return 1;
 }
@@ -1215,7 +1224,7 @@ int drmModeAtomicAddProperty(drmModeAtomicReq *req,
     req->obj_ids[i]    = object_id;
     req->prop_ids[i]   = property_id;
     req->values[i]     = value;
-    return 0;
+    return req->prop_count; /* real libdrm returns count on success */
 }
 
 int drmModeAtomicCommit(int fd, drmModeAtomicReq *req,
@@ -1225,6 +1234,9 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReq *req,
     if (!req) { errno = EINVAL; return -1; }
 
     ensure_obj_properties();
+
+    fprintf(stderr, "[atomic-commit] enter req=%p flags=0x%x user_data=%p props=%u\n",
+            (void*)req, flags, user_data, req->prop_count);
 
     /* Apply all property changes */
     uint32_t new_fb_id = 0;
@@ -1237,6 +1249,12 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReq *req,
         uint32_t prop_id = req->prop_ids[i];
         uint64_t val     = req->values[i];
 
+        const char *pname = (prop_id > 0 && prop_id <= (uint32_t)g_prop_count)
+                          ? g_props[prop_id - 1].name : "???";
+
+        fprintf(stderr, "[atomic-commit]  prop[%d] obj=%u prop=%u (%s) val=%llu\n",
+                i, obj_id, prop_id, pname, (unsigned long long)val);
+
         /* Find the object's prop record (matched by obj_id only —
          * atomic API doesn't carry obj_type in the request)         */
         obj_props_t *op = NULL;
@@ -1244,20 +1262,26 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReq *req,
             if (g_obj_props[j].obj_id == obj_id) {
                 op = &g_obj_props[j]; break;
             }
-        if (!op) continue;
+        if (!op) {
+            fprintf(stderr, "[atomic-commit]  no obj prop record for obj=%u\n", obj_id);
+            continue;
+        }
 
         set_obj_prop(op, prop_id, val);
 
         /* Track FB_ID changes for page flip */
-        if (strcmp(g_props[prop_id - 1].name, "FB_ID") == 0) {
+        if (strcmp(pname, "FB_ID") == 0) {
             new_fb_id = (uint32_t)val;
             new_plane_id = obj_id;
+            fprintf(stderr, "[atomic-commit]  found FB_ID=%u plane=%u\n",
+                    new_fb_id, new_plane_id);
         }
     }
 
-    /* If this is a page flip with a new FB, send the surface */
-    if (flags & DRM_MODE_PAGE_FLIP_EVENT && new_fb_id > 0) {
-        /* Resolve FB to surface and send like drmModePageFlip */
+    /* Send surface to framebufferd if we have a framebuffer */
+    if (new_fb_id > 0) {
+        fprintf(stderr, "[atomic-commit] page_flip fb_id=%u user_data=%p\n",
+                new_fb_id, user_data);
         IOSurfaceRef surf = fb_id_to_surface(new_fb_id);
         if (surf) {
             mach_port_t surface_port = IOSurfaceCreateMachPort(surf);
@@ -1268,11 +1292,26 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReq *req,
             drm_send_json_with_surface(buf, surface_port);
             if (surface_port != MACH_PORT_NULL)
                 mach_port_deallocate(mach_task_self(), surface_port);
+        } else {
+            fprintf(stderr, "[atomic-commit] no surface for fb_id %u\n", new_fb_id);
         }
         g_state.crtc_fb_id = new_fb_id;
     }
 
-    (void)user_data;
+    /* Always signal page flip completion when PAGE_FLIP_EVENT is requested,
+     * even with FB_ID=0 (initial modeset). Weston waits for this event
+     * to start its repaint loop. */
+    if (flags & DRM_MODE_PAGE_FLIP_EVENT) {
+        g_pending_flip_data = user_data;
+        if (g_drm_event_pipe_write >= 0) {
+            char byte = 1;
+            ssize_t w = write(g_drm_event_pipe_write, &byte, 1);
+            fprintf(stderr, "[atomic-commit] wrote event byte (ret=%zd)\n", w);
+            (void)w;
+        }
+    }
+
+    fprintf(stderr, "[atomic-commit] done ret=0\n");
     return 0;
 }
 

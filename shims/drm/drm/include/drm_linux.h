@@ -138,7 +138,7 @@ typedef struct drmModeRes {
 
 /* ── page-flip event ──────────────────────────────────────────────────── */
 
-#define DRM_EVENT_CONTEXT_VERSION 2
+#define DRM_EVENT_CONTEXT_VERSION 4
 
 typedef struct drmEventContext {
     int version;
@@ -152,6 +152,12 @@ typedef struct drmEventContext {
                               unsigned int tv_sec,
                               unsigned int tv_usec,
                               void *user_data);
+    void (*page_flip_handler2)(int fd,
+                               unsigned int sequence,
+                               unsigned int tv_sec,
+                               unsigned int tv_usec,
+                               unsigned int crtc_id,
+                               void *user_data);
 } drmEventContext, *drmEventContextPtr;
 
 /* ── page-flip flags ──────────────────────────────────────────────────── */

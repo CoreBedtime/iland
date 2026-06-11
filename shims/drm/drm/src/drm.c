@@ -63,12 +63,9 @@ int drm_send_json(const char *json)
     msg.json_len = (uint32_t)len;
     memcpy(msg.json, json, len);
 
-    /* Compute message size as fixed struct prefix up to (but not including)
-     * the json array, plus the actual json data.  Using sizeof captures
-     * any compiler-inserted padding between struct fields; manually
-     * summing individual field sizes may undercount if new fields or
-     * alignment padding is added. */
     size_t msg_size = sizeof(drm_ipc_msg_t) - DRM_IPC_JSON_MAX + len;
+    /* mach_msg requires 4-byte aligned message size */
+    msg_size = (msg_size + 3) & ~(size_t)3;
     return send_msg(&msg, msg_size);
 }
 
@@ -102,5 +99,7 @@ int drm_send_json_with_surface(const char *json, mach_port_t surface_port)
     memcpy(msg.json, json, len);
 
     size_t msg_size = sizeof(drm_ipc_msg_t) - DRM_IPC_JSON_MAX + len;
+    /* mach_msg requires 4-byte aligned message size */
+    msg_size = (msg_size + 3) & ~(size_t)3;
     return send_msg(&msg, msg_size);
 }
