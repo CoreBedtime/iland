@@ -1,4 +1,5 @@
 #include <_abort.h>
+#include <_stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>
@@ -180,6 +181,9 @@ static char **clean_environ(void) {
         clean[j++] = environ[i];
     }
     clean[j] = NULL;
+
+    unsetenv("DYLD_INSERT_LIBRARIES");
+
     return clean;
 }
 

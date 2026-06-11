@@ -13,33 +13,85 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-/* ── static mode table ────────────────────────────────────────────────── */
+/* ── dynamic mode table (reads display resolution from plist) ────────── */
 
-static const drmModeModeInfo g_modes[] = {
-    {
-        .clock        = 148500,
-        .hdisplay     = 1920, .hsync_start = 2008,
-        .hsync_end    = 2052, .htotal      = 2200, .hskew = 0,
-        .vdisplay     = 1080, .vsync_start = 1084,
-        .vsync_end    = 1089, .vtotal      = 1125, .vscan = 0,
-        .vrefresh     = 60,
-        .flags        = 0,
-        .type         = 0,
-        .name         = "1920x1080",
-    },
-    {
-        .clock        = 74250,
-        .hdisplay     = 1280, .hsync_start = 1390,
-        .hsync_end    = 1430, .htotal      = 1650, .hskew = 0,
-        .vdisplay     = 720,  .vsync_start = 725,
-        .vsync_end    = 730, .vtotal       = 750, .vscan = 0,
-        .vrefresh     = 60,
-        .flags        = 0,
-        .type         = 0,
-        .name         = "1280x720",
-    },
-};
-#define G_MODE_COUNT  ((int)(sizeof(g_modes) / sizeof(g_modes[0])))
+#include <CoreFoundation/CoreFoundation.h>
+
+static drmModeModeInfo g_modes[4];
+static int g_mode_count;
+
+static void init_modes(void)
+{
+    if (g_mode_count > 0) return;
+
+    uint32_t pw = 1920, ph = 1080;
+
+    CFURLRef url = CFURLCreateWithFileSystemPath(NULL,
+        CFSTR("/Library/Preferences/com.apple.windowserver.displays.plist"),
+        kCFURLPOSIXPathStyle, false);
+    CFReadStreamRef stream = CFReadStreamCreateWithFile(NULL, url);
+    if (stream && CFReadStreamOpen(stream)) {
+        CFPropertyListRef plist = CFPropertyListCreateWithStream(NULL,
+            stream, 0, kCFPropertyListImmutable, NULL, NULL);
+        if (plist && CFGetTypeID(plist) == CFDictionaryGetTypeID()) {
+            CFDictionaryRef userSets = CFDictionaryGetValue(plist, CFSTR("DisplayAnyUserSets"));
+            if (userSets && CFGetTypeID(userSets) == CFDictionaryGetTypeID()) {
+                CFArrayRef configs = CFDictionaryGetValue(userSets, CFSTR("Configs"));
+                if (configs && CFGetTypeID(configs) == CFArrayGetTypeID()) {
+                    for (CFIndex i = 0; i < CFArrayGetCount(configs); i++) {
+                        CFDictionaryRef cfg = CFArrayGetValueAtIndex(configs, i);
+                        if (!cfg || CFGetTypeID(cfg) != CFDictionaryGetTypeID()) continue;
+                        CFArrayRef dispCfg = CFDictionaryGetValue(cfg, CFSTR("DisplayConfig"));
+                        if (!dispCfg || CFGetTypeID(dispCfg) != CFArrayGetTypeID()) continue;
+                        for (CFIndex j = 0; j < CFArrayGetCount(dispCfg); j++) {
+                            CFDictionaryRef disp = CFArrayGetValueAtIndex(dispCfg, j);
+                            if (!disp || CFGetTypeID(disp) != CFDictionaryGetTypeID()) continue;
+                            CFDictionaryRef info = CFDictionaryGetValue(disp, CFSTR("CurrentInfo"));
+                            if (!info || CFGetTypeID(info) != CFDictionaryGetTypeID()) continue;
+                            CFNumberRef wide = CFDictionaryGetValue(info, CFSTR("Wide"));
+                            CFNumberRef high = CFDictionaryGetValue(info, CFSTR("High"));
+                            if (wide && high &&
+                                CFNumberGetValue(wide, kCFNumberSInt32Type, &pw) &&
+                                CFNumberGetValue(high, kCFNumberSInt32Type, &ph) &&
+                                pw > 0 && ph > 0) {
+                                goto found;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+found:
+        if (plist) CFRelease(plist);
+        CFReadStreamClose(stream);
+    }
+    if (stream) CFRelease(stream);
+    if (url) CFRelease(url);
+    /* Native mode */
+    drmModeModeInfo *m = &g_modes[g_mode_count++];
+    memset(m, 0, sizeof(*m));
+    m->clock       = (pw * ph * 60 + 500) / 1000;
+    m->hdisplay    = pw;  m->hsync_start = pw + 88;
+    m->hsync_end   = pw + 88 + 44;  m->htotal = pw + 88 + 44 + 168;
+    m->vdisplay    = ph;  m->vsync_start = ph + 4;
+    m->vsync_end   = ph + 4 + 5;   m->vtotal = ph + 4 + 5 + 36;
+    m->vrefresh    = 60;
+    m->type        = 0;
+    snprintf(m->name, sizeof(m->name), "%ux%u", pw, ph);
+
+    /* 1920x1080 fallback */
+    m = &g_modes[g_mode_count++];
+    memset(m, 0, sizeof(*m));
+    m->clock       = 148500;
+    m->hdisplay    = 1920; m->hsync_start = 2008;
+    m->hsync_end   = 2052; m->htotal = 2200;
+    m->vdisplay    = 1080; m->vsync_start = 1084;
+    m->vsync_end   = 1089; m->vtotal = 1125;
+    m->vrefresh    = 60;
+    m->type        = 0;
+    snprintf(m->name, sizeof(m->name), "1920x1080");
+}
+#define G_MODE_COUNT  g_mode_count
 
 /* active CRTC state */
 static struct {
@@ -168,6 +220,7 @@ drmModeConnectorPtr drmModeGetConnector(int fd, uint32_t connector_id)
     c->mmHeight          = 296;
     c->subpixel          = 0;
 
+    init_modes();
     c->count_modes       = G_MODE_COUNT;
     c->modes             = malloc(G_MODE_COUNT * sizeof(drmModeModeInfo));
     memcpy(c->modes, g_modes, G_MODE_COUNT * sizeof(drmModeModeInfo));
