@@ -35,6 +35,8 @@ extern "C" {
 #define DRM_FORMAT_BGRX1010102          0x30335842
 #define DRM_FORMAT_BGRX4444             0x32315842
 #define DRM_FORMAT_BGRX5551             0x35315842
+#define DRM_FORMAT_AYUV                 0x56555941
+#define DRM_FORMAT_BIG_ENDIAN           (1U << 31)
 #define DRM_FORMAT_BGRX8888             0x34325842
 #define DRM_FORMAT_GR1616               0x32335247
 #define DRM_FORMAT_GR88                 0x38385247

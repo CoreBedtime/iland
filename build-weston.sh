@@ -12,6 +12,16 @@ STUB_PCDIR="$DEPS_DIR/pkgconfig"
 SHIM_DYLIB="$SHIM_BUILD/libwayland-mac.dylib"
 
 # ============================================================
+# 0. Clone weston source if not present
+# ============================================================
+if [ ! -d "$WESTON_DIR/.git" ]; then
+    echo "=== Cloning weston ==="
+    git clone --depth 1 --branch 15.0 \
+        https://gitlab.com/freedesktop-sdk/mirrors/freedesktop/wayland/weston.git \
+        "$WESTON_DIR"
+fi
+
+# ============================================================
 # 1. Build the shim
 # ============================================================
 echo "=== Building shim ==="
@@ -49,8 +59,18 @@ cat > "$STUB_INCDIR/malloc.h" << 'EOF'
 EOF
 
 cat > "$STUB_INCDIR/drm.h" << 'EOF'
+#include <stdint.h>
+
 #define DRM_MODE_CONNECTOR_LVDS 7
 #define DRM_MODE_CONNECTOR_eDP  14
+
+/* Color management LUT entry used by weston DRM backend */
+struct drm_color_lut {
+    uint16_t red;
+    uint16_t green;
+    uint16_t blue;
+    uint16_t reserved;
+};
 EOF
 
 cat > "$STUB_INCDIR/linux/limits.h" << 'EOF'
@@ -243,6 +263,7 @@ cat > "$STUB_INCDIR/linux/input.h" << 'EOF'
 #define KEY_F9          67
 #define KEY_F10         68
 #define KEY_F11         87
+#define KEY_Q           16
 #define KEY_SPACE       57
 #define KEY_LEFTSHIFT   42
 #define KEY_UP          103
@@ -440,12 +461,14 @@ cat > "$STUB_INCDIR/libinput.h" << 'EOF'
 #define LIBINPUT_H
 #include <stdint.h>
 #include <stddef.h>
+#include <libudev.h>
 enum libinput_event_type {
     LIBINPUT_EVENT_NONE=0, LIBINPUT_EVENT_DEVICE_ADDED, LIBINPUT_EVENT_DEVICE_REMOVED,
     LIBINPUT_EVENT_KEYBOARD_KEY, LIBINPUT_EVENT_POINTER_MOTION,
     LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE, LIBINPUT_EVENT_POINTER_BUTTON,
     LIBINPUT_EVENT_POINTER_AXIS, LIBINPUT_EVENT_TOUCH_DOWN, LIBINPUT_EVENT_TOUCH_UP,
     LIBINPUT_EVENT_TOUCH_MOTION, LIBINPUT_EVENT_TOUCH_CANCEL,
+    LIBINPUT_EVENT_TOUCH_FRAME,
     LIBINPUT_EVENT_TABLET_TOOL_AXIS, LIBINPUT_EVENT_TABLET_TOOL_PROXIMITY,
     LIBINPUT_EVENT_TABLET_TOOL_TIP, LIBINPUT_EVENT_TABLET_TOOL_BUTTON,
     LIBINPUT_EVENT_TABLET_PAD_BUTTON, LIBINPUT_EVENT_TABLET_PAD_RING,
@@ -458,6 +481,10 @@ enum libinput_capability { LIBINPUT_DEVICE_CAP_KEYBOARD=0, LIBINPUT_DEVICE_CAP_P
     LIBINPUT_DEVICE_CAP_TOUCH=2, LIBINPUT_DEVICE_CAP_TABLET_TOOL=3,
     LIBINPUT_DEVICE_CAP_TABLET_PAD=4, LIBINPUT_DEVICE_CAP_GESTURE=5, LIBINPUT_DEVICE_CAP_SWITCH=6 };
 enum libinput_led { LIBINPUT_LED_NUM_LOCK=1, LIBINPUT_LED_CAPS_LOCK=2, LIBINPUT_LED_SCROLL_LOCK=4 };
+enum libinput_key_state { LIBINPUT_KEY_STATE_RELEASED=0, LIBINPUT_KEY_STATE_PRESSED=1 };
+enum libinput_button_state { LIBINPUT_BUTTON_STATE_RELEASED=0, LIBINPUT_BUTTON_STATE_PRESSED=1 };
+enum libinput_tablet_tool_proximity_state { LIBINPUT_TABLET_TOOL_PROXIMITY_STATE_OUT=0, LIBINPUT_TABLET_TOOL_PROXIMITY_STATE_IN=1 };
+enum libinput_tablet_tool_tip_state { LIBINPUT_TABLET_TOOL_TIP_UP=0, LIBINPUT_TABLET_TOOL_TIP_DOWN=1 };
 enum libinput_pointer_axis { LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL=0, LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL=1 };
 enum libinput_pointer_axis_source { LIBINPUT_POINTER_AXIS_SOURCE_WHEEL=1,
     LIBINPUT_POINTER_AXIS_SOURCE_FINGER=2, LIBINPUT_POINTER_AXIS_SOURCE_CONTINUOUS=3,
@@ -469,12 +496,19 @@ enum libinput_config_scroll_method { LIBINPUT_CONFIG_SCROLL_NO_SCROLL=0,
 enum libinput_config_status { LIBINPUT_CONFIG_STATUS_SUCCESS=0,
     LIBINPUT_CONFIG_STATUS_UNSUPPORTED=1, LIBINPUT_CONFIG_STATUS_INVALID=2 };
 enum libinput_tablet_tool_type { LIBINPUT_TABLET_TOOL_TYPE_PEN=1, LIBINPUT_TABLET_TOOL_TYPE_ERASER=2 };
+enum libinput_log_priority { LIBINPUT_LOG_PRIORITY_ERROR=3, LIBINPUT_LOG_PRIORITY_INFO=4, LIBINPUT_LOG_PRIORITY_DEBUG=7 };
 struct libinput;
 struct libinput_event;
 struct libinput_device;
 struct libinput_seat;
 struct libinput_tablet_tool;
+struct libinput_event_keyboard;
+struct libinput_event_pointer;
+struct libinput_event_touch;
+struct libinput_event_tablet_tool;
 struct libinput_interface { int (*open_restricted)(const char *, int, void *); void (*close_restricted)(int, void *); };
+#include <stdarg.h>
+typedef void (*libinput_log_handler)(struct libinput *, enum libinput_log_priority, const char *, va_list);
 
 struct libinput *libinput_udev_create_context(const struct libinput_interface *, void *, struct udev *);
 struct libinput *libinput_unref(struct libinput *);
@@ -581,8 +615,8 @@ int libinput_tablet_tool_has_tilt(struct libinput_tablet_tool *);
 void libinput_tablet_tool_set_user_data(struct libinput_tablet_tool *, void *);
 void *libinput_tablet_tool_get_user_data(struct libinput_tablet_tool *);
 void *libinput_get_user_data(struct libinput *);
-enum libinput_log_priority { LIBINPUT_LOG_PRIORITY_INFO=4, LIBINPUT_LOG_PRIORITY_DEBUG=7 };
-void libinput_log_set_handler(void (*)(struct libinput *, enum libinput_log_priority, const char *, void *));
+void libinput_log_set_handler(struct libinput *, libinput_log_handler);
+void libinput_log_set_priority(struct libinput *, enum libinput_log_priority);
 #endif /* LIBINPUT_H */
 EOF
 
@@ -595,10 +629,19 @@ done
 cat > "$DEPS_DIR/libinput-stub.c" << 'STUBEOF'
 #include <stddef.h>
 #include <stdint.h>
-int libinput_udev_create_context(const void *i, void *u, void *ud) { (void)i;(void)u;(void)ud; return 0; }
+#include <libudev.h>
+#include <fcntl.h>
+#include <unistd.h>
+static char dummy_libinput_ctx;
+static int dummy_libinput_pipe[2] = {-1, -1};
+void *libinput_udev_create_context(const void *i, void *u, void *ud) {
+    (void)i;(void)u;(void)ud;
+    if (dummy_libinput_pipe[0] < 0) pipe(dummy_libinput_pipe);
+    return &dummy_libinput_ctx;
+}
 void *libinput_unref(void *l) { (void)l; return NULL; }
-int libinput_udev_assign_seat(void *l, const char *s) { (void)l;(void)s; return -1; }
-int libinput_get_fd(void *l) { (void)l; return -1; }
+int libinput_udev_assign_seat(void *l, const char *s) { (void)l;(void)s; return 0; }
+int libinput_get_fd(void *l) { (void)l; return dummy_libinput_pipe[0]; }
 int libinput_dispatch(void *l) { (void)l; return 0; }
 void *libinput_get_event(void *l) { (void)l; return NULL; }
 void libinput_event_destroy(void *e) { (void)e; }
@@ -699,8 +742,11 @@ int libinput_tablet_tool_has_distance(void *t) { (void)t; return 0; }
 int libinput_tablet_tool_has_tilt(void *t) { (void)t; return 0; }
 void libinput_tablet_tool_set_user_data(void *t, void *d) { (void)t;(void)d; }
 void *libinput_tablet_tool_get_user_data(void *t) { (void)t; return NULL; }
+void *libinput_get_user_data(void *l) { (void)l; return NULL; }
+void libinput_log_set_handler(void *l, void *h) { (void)l;(void)h; }
+void libinput_log_set_priority(void *l, int p) { (void)l;(void)p; }
 STUBEOF
-cc -dynamiclib -o "$STUB_LIBDIR/libinput.dylib" "$DEPS_DIR/libinput-stub.c" \
+cc -I"$STUB_INCDIR" -dynamiclib -o "$STUB_LIBDIR/libinput.dylib" "$DEPS_DIR/libinput-stub.c" \
     -install_name "$STUB_LIBDIR/libinput.dylib"
 
 # ---- libseat stub ----
@@ -811,7 +857,7 @@ for pkg in libudev:udev libinput:input libevdev:evdev libseat:seat; do
     link="${pkg##*:}"
     ver="2.0.0"
     [ "$name" = "libudev" ] && ver="255"
-    [ "$name" = "libinput" ] && ver="1.0.0"
+    [ "$name" = "libinput" ] && ver="1.2.0"
     cat > "$STUB_PCDIR/$name.pc" << EOF
 prefix=${STUB_LIBDIR}/..
 exec_prefix=\${prefix}
@@ -840,8 +886,70 @@ EOF
 echo "pkg-config files created in $STUB_PCDIR"
 
 # ============================================================
-# 4. Configure and build weston
+# 4. Fetch wayland-protocols (needed by weston for protocol XMLs)
 # ============================================================
+WP_DIR="$DEPS_DIR/wayland-protocols"
+if [ ! -d "$WP_DIR/.git" ]; then
+    echo "=== Fetching wayland-protocols ==="
+    git clone --depth 1 --branch 1.49 \
+        https://gitlab.freedesktop.org/wayland/wayland-protocols.git \
+        "$WP_DIR"
+else
+    echo "=== wayland-protocols already fetched ==="
+fi
+
+cat > "$STUB_PCDIR/wayland-protocols.pc" << EOF
+prefix=${WP_DIR}
+datarootdir=\${prefix}
+pkgdatadir=\${datarootdir}
+Name: Wayland Protocols
+Description: Wayland protocol files
+Version: 1.49
+EOF
+
+# ============================================================
+# 5. Configure and build weston
+# ============================================================
+echo "=== Creating compiler wrapper (strips -Wl,--version-script for macOS ld) ==="
+WRAPPER_DIR="$BUILD_DIR/wrapper"
+mkdir -p "$WRAPPER_DIR"
+# Wrap clang to strip -Wl,--version-script (macOS ld64 doesn't support it)
+cat > "$WRAPPER_DIR/cc" << 'WRAPEOF'
+#!/bin/bash
+args=()
+skip=0
+for arg in "$@"; do
+    if [ "$skip" -eq 1 ]; then skip=0; continue; fi
+    # Strip -Wl,--version-script,/path or -Wl,--version-script,/path
+    if [[ "$arg" == *--version-script* ]]; then
+        if [[ "$arg" == -Wl,--version-script,* ]]; then continue; fi
+        if [[ "$arg" == -Wl,--version-script ]]; then skip=1; continue; fi
+    fi
+    args+=("$arg")
+done
+exec /usr/bin/clang "${args[@]}"
+WRAPEOF
+chmod +x "$WRAPPER_DIR/cc"
+ln -sf "$WRAPPER_DIR/cc" "$WRAPPER_DIR/clang"
+# Also wrap c++ for the edid-decode subproject
+cat > "$WRAPPER_DIR/c++" << 'WRAPEOF'
+#!/bin/bash
+args=()
+skip=0
+for arg in "$@"; do
+    if [ "$skip" -eq 1 ]; then skip=0; continue; fi
+    if [[ "$arg" == *--version-script* ]]; then
+        if [[ "$arg" == -Wl,--version-script,* ]]; then continue; fi
+        if [[ "$arg" == -Wl,--version-script ]]; then skip=1; continue; fi
+    fi
+    args+=("$arg")
+done
+exec /usr/bin/clang++ "${args[@]}"
+WRAPEOF
+chmod +x "$WRAPPER_DIR/c++"
+ln -sf "$WRAPPER_DIR/c++" "$WRAPPER_DIR/clang++"
+export PATH="$WRAPPER_DIR:$PATH"
+
 echo "=== Configuring weston ==="
 export PKG_CONFIG_PATH="$STUB_PCDIR:/opt/local/lib/pkgconfig"
 export CFLAGS="-I$STUB_INCDIR -DHAVE_MKOSTEMP=1 -DHAVE_STRCHRNUL=1 -DHAVE_INITGROUPS=1"
@@ -855,6 +963,8 @@ meson setup "$BUILD_DIR" "$WESTON_DIR" --reconfigure \
     -Dbackend-rdp=false \
     -Dbackend-vnc=false \
     -Dbackend-pipewire=false \
+    -Dpipewire=false \
+    -Dremoting=false \
     -Dbackend-default=drm \
     -Drenderer-gl=true \
     -Drenderer-vulkan=false \

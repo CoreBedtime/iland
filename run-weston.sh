@@ -32,6 +32,7 @@ sudo env \
     XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
     WESTON_DATA_DIR="$WESTON_DATA_DIR" \
     "$BUILD_DIR/frontend/weston" --backend=drm \
+    --continue-without-input \
     --config=/Volumes/Bedtime/Developer/myland/weston.ini &
 
 WESTON_PID=$!
@@ -50,7 +51,7 @@ sudo env \
             WESTON_DATA_DIR="$WESTON_DATA_DIR" \
             XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
             WAYLAND_DISPLAY="$DNAME" \
-            "$BUILD_DIR/clients/weston-terminal" \
+            "$BUILD_DIR/clients/weston-terminal" --shell=/Volumes/Bedtime/Developer/myland/weston/data/terminal-wrapper.sh \
             2>/tmp/weston-terminal-err.log &
         TERMINAL_PID=$!
         echo "Terminal PID: $TERMINAL_PID"
