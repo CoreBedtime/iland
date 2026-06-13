@@ -384,17 +384,6 @@ int libevdev_event_code_from_name(const char *name, int len) { return -1; }
 EOF
 cc -dynamiclib -o "$STUB_LIBDIR/libevdev.dylib" "$DEPS_DIR/libevdev-stub.c" -install_name "$STUB_LIBDIR/libevdev.dylib"
 
-# ---- libudev stub (from shims/udev) ----
-cc -I"$SCRIPT_DIR/shims/udev/include" -dynamiclib -o "$STUB_LIBDIR/libudev.dylib" \
-    "$SCRIPT_DIR/shims/udev/src/udev.c" \
-    -install_name "$STUB_LIBDIR/libudev.dylib"
-
-# ---- libinput stub (from shims/libinput) ----
-cc -I"$SCRIPT_DIR/shims/libinput/include" -I"$SCRIPT_DIR/shims/udev/include" \
-    -dynamiclib -o "$STUB_LIBDIR/libinput.dylib" \
-    "$SCRIPT_DIR/shims/libinput/input/libinput.c" \
-    -install_name "$STUB_LIBDIR/libinput.dylib"
-
 # ---- libseat stub ----
 cat > "$STUB_INCDIR/libseat.h" << 'EOF'
 #include <stddef.h>
@@ -497,29 +486,30 @@ Version: 1.23.0
 Cflags: -I\${prefix}/include
 EOF
 
-# libudev .pc (uses shims/udev header)
+# libudev .pc — symbols in wayland-mac.dylib via -force_load
 cat > "$STUB_PCDIR/libudev.pc" << EOF
 prefix=${SCRIPT_DIR}
 exec_prefix=\${prefix}
-libdir=${STUB_LIBDIR}
+libdir=${SHIM_BUILD}
 includedir=${SCRIPT_DIR}/shims/udev/include
 Name: libudev
 Description: udev via wayland-mac shim
 Version: 255
-Libs: -L\${libdir} -ludev
+Libs: -L\${libdir} -lwayland-mac
 Cflags: -I\${includedir}
 EOF
 
-# libinput .pc (uses shims/libinput header; requires libudev)
+# libinput .pc — symbols in wayland-mac.dylib via -force_load
+# Requires libudev for its headers (libinput.h includes <libudev.h>)
 cat > "$STUB_PCDIR/libinput.pc" << EOF
 prefix=${SCRIPT_DIR}
 exec_prefix=\${prefix}
-libdir=${STUB_LIBDIR}
+libdir=${SHIM_BUILD}
 includedir=${SCRIPT_DIR}/shims/libinput/include
 Name: libinput
 Description: libinput via wayland-mac shim
 Version: 1.2.0
-Libs: -L\${libdir} -linput
+Libs: -L\${libdir} -lwayland-mac
 Cflags: -I\${includedir}
 Requires: libudev
 EOF

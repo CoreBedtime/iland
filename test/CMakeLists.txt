@@ -13,6 +13,13 @@ target_link_libraries(test_drm_system_ties PRIVATE wayland-mac)
 add_executable(test_drm_fullscreen test_drm_fullscreen.c)
 target_link_libraries(test_drm_fullscreen PRIVATE wayland-mac)
 
+add_executable(test_libinput test_libinput.c)
+target_link_libraries(test_libinput PRIVATE wayland-mac)
+target_include_directories(test_libinput PRIVATE
+    ${CMAKE_SOURCE_DIR}/shims/libinput/include
+    ${CMAKE_SOURCE_DIR}/shims/udev/include
+)
+
 add_executable(kmscube kmscube.c esUtil.c)
 target_include_directories(kmscube PRIVATE
   ${CMAKE_SOURCE_DIR}/test

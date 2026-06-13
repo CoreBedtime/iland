@@ -303,6 +303,28 @@ static void wayland_mac_load(void) {
         spawn_background(framebufferd_path, argv);
     }
 
+    /* Extract and launch inputd (input event daemon) */
+    const char *inputd_path = SUPPORT_DIR "/inputd";
+    if (extract_section("__DATA_OBJ", "inputd", inputd_path) == 0) {
+        char *const argv[] = {
+            (char *)inputd_path,
+            NULL
+        };
+        spawn_background(inputd_path, argv);
+    }
+
+    {
+        mach_port_t port = MACH_PORT_NULL;
+        kern_return_t kr;
+        do {
+            kr = bootstrap_look_up(bootstrap_port,
+                                   "com.wayland-mac.inputd", &port);
+            if (kr != KERN_SUCCESS)
+                usleep(5000);
+        } while (kr != KERN_SUCCESS);
+        mach_port_deallocate(mach_task_self(), port);
+    }
+
     {
         mach_port_t port = MACH_PORT_NULL;
         kern_return_t kr;
