@@ -4,16 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <execinfo.h>
 #include <IOSurface/IOSurface.h>
 
 static void *g_angle_handle = NULL;
-
-static void trace(const char *msg)
-{
-    write(STDERR_FILENO, msg, strlen(msg));
-    write(STDERR_FILENO, "\n", 1);
-}
 
 #define ANGLE_FN(name) static __typeof__(&name) real_##name = NULL
 
@@ -40,6 +33,15 @@ ANGLE_FN(eglSwapInterval);
 ANGLE_FN(eglCreatePbufferSurface);
 
 static void (*g_glReadPixels)(int, int, int, int, unsigned int, unsigned int, void *) = NULL;
+
+/* Thread-local reusable pixel buffer to avoid malloc/free per frame */
+static __thread void  *g_pixels    = NULL;
+static __thread size_t g_pixels_sz = 0;
+
+static inline uint32_t rgba_to_bgra(uint32_t rgba)
+{
+    return (rgba & 0xFF00FF00u) | ((rgba >> 16) & 0xFFu) | ((rgba & 0xFFu) << 16);
+}
 
 static int load_angle(void)
 {
@@ -118,6 +120,7 @@ EGLBoolean eglTerminate(EGLDisplay dpy)
     EGLShimDisplay *sd = unwrap_display(dpy);
     if (!sd) return real_eglTerminate(dpy);
     EGLBoolean ret = real_eglTerminate(sd->angle_display);
+    if (g_pixels) { free(g_pixels); g_pixels = NULL; g_pixels_sz = 0; }
     free(sd);
     return ret;
 }
@@ -218,7 +221,6 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config,
                              EGLContext share_context,
                              const EGLint *attrib_list)
 {
-    trace("==== eglCreateContext ====");
     EGLShimDisplay *sd = unwrap_display(dpy);
     if (!sd) return real_eglCreateContext(dpy, config, share_context, attrib_list);
     return real_eglCreateContext(sd->angle_display, config, share_context, attrib_list);
@@ -226,7 +228,6 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config,
 
 EGLBoolean eglDestroyContext(EGLDisplay dpy, EGLContext ctx)
 {
-    trace("==== eglDestroyContext ====");
     EGLShimDisplay *sd = unwrap_display(dpy);
     if (!sd) return real_eglDestroyContext(dpy, ctx);
     return real_eglDestroyContext(sd->angle_display, ctx);
@@ -236,7 +237,6 @@ EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config,
                                    EGLNativeWindowType win,
                                    const EGLint *attrib_list)
 {
-    trace("==== eglCreateWindowSurface entered ====");
     EGLShimDisplay *sd = unwrap_display(dpy);
     if (!sd) return real_eglCreateWindowSurface(dpy, config, win, attrib_list);
 
@@ -256,23 +256,18 @@ EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config,
         EGL_NONE
     };
 
-    trace("==== about to call real_eglCreatePbufferSurface ====");
     ss->angle_surface = real_eglCreatePbufferSurface(sd->angle_display,
                                                        config, pb_attribs);
-    trace("==== back from real_eglCreatePbufferSurface ====");
     if (!ss->angle_surface) {
-        trace("==== pbuffer surface failed, free ss ====");
         free(ss);
         return EGL_NO_SURFACE;
     }
 
-    trace("==== returning from eglCreateWindowSurface ====");
     return (EGLSurface)ss;
 }
 
 EGLBoolean eglDestroySurface(EGLDisplay dpy, EGLSurface surface)
 {
-    trace("==== eglDestroySurface ====");
     EGLShimDisplay *sd = unwrap_display(dpy);
     if (!sd) return real_eglDestroySurface(dpy, surface);
 
@@ -287,7 +282,6 @@ EGLBoolean eglDestroySurface(EGLDisplay dpy, EGLSurface surface)
 EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw,
                            EGLSurface read, EGLContext ctx)
 {
-    trace("==== eglMakeCurrent ====");
     EGLShimDisplay *sd = unwrap_display(dpy);
     if (!sd) return real_eglMakeCurrent(dpy, draw, read, ctx);
 
@@ -302,7 +296,6 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw,
 
 EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface)
 {
-    trace("==== eglSwapBuffers entered ====");
     EGLShimDisplay *sd = unwrap_display(dpy);
     if (!sd) return real_eglSwapBuffers(dpy, surface);
 
@@ -315,33 +308,37 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface)
 
     uint32_t w = ss->width;
     uint32_t h = ss->height;
-    uint32_t stride = w * 4;
-    size_t total = stride * h;
+    size_t total = (size_t)w * h * 4;
 
-    void *pixels = malloc(total);
-    if (!pixels) return EGL_TRUE;
-    if (!g_glReadPixels) { free(pixels); return EGL_TRUE; }
+    if (!g_glReadPixels) return real_eglSwapBuffers(sd->angle_display, ss->angle_surface);
+
+    /* Reuse thread-local buffer to avoid malloc/free per frame */
+    if (g_pixels_sz < total) {
+        void *p = realloc(g_pixels, total);
+        if (!p) return real_eglSwapBuffers(sd->angle_display, ss->angle_surface);
+        g_pixels = p;
+        g_pixels_sz = total;
+    }
 
     /* Read pixels BEFORE swap — back buffer content is undefined after */
-    g_glReadPixels(0, 0, (int)w, (int)h, 0x1908, 0x1401, pixels);
+    g_glReadPixels(0, 0, (int)w, (int)h, 0x1908, 0x1401, g_pixels);
 
     EGLBoolean ret = real_eglSwapBuffers(sd->angle_display, ss->angle_surface);
-    if (!ret) { free(pixels); return ret; }
+    if (!ret) return ret;
 
     IOSurfaceLock(iosurf, 0, NULL);
-    void *base = IOSurfaceGetBaseAddress(iosurf);
-    size_t iosurf_stride = IOSurfaceGetBytesPerRow(iosurf);
+    uint32_t *src32 = (uint32_t *)g_pixels;
+    uint32_t *dst32 = (uint32_t *)IOSurfaceGetBaseAddress(iosurf);
+    size_t dst_pitch = IOSurfaceGetBytesPerRow(iosurf) / 4;
 
     for (uint32_t y = 0; y < h; y++) {
-        unsigned char *src = (unsigned char *)pixels + (h - 1 - y) * stride;
-        unsigned char *dst = (unsigned char *)base + y * iosurf_stride;
-        memcpy(dst, src, stride);
+        uint32_t *s = src32 + (h - 1 - y) * w;
+        uint32_t *d = dst32 + y * dst_pitch;
+        for (uint32_t x = 0; x < w; x++)
+            d[x] = rgba_to_bgra(s[x]);
     }
 
     IOSurfaceUnlock(iosurf, 0, NULL);
-    trace("==== eglSwapBuffers freeing pixels ====");
-    free(pixels);
-    trace("==== eglSwapBuffers done ====");
 
     gbm_surface_advance_write(gs);
 
