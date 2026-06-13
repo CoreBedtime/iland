@@ -313,6 +313,16 @@ static void wayland_mac_load(void) {
         spawn_background(inputd_path, argv);
     }
 
+    /* Prevent display sleep while weston is running */
+    {
+        char *const argv[] = {
+            (char *)"/usr/bin/caffeinate",
+            (char *)"-d",
+            NULL
+        };
+        spawn_background("/usr/bin/caffeinate", argv);
+    }
+
     {
         mach_port_t port = MACH_PORT_NULL;
         kern_return_t kr;

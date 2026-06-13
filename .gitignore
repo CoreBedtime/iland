@@ -9,3 +9,4 @@ AGENTS.md
 .DS_Store
 FrameBufferService/
 weston/
+multitouch_source/

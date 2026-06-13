@@ -123,6 +123,8 @@ static void TimerCallback(CFRunLoopTimerRef timer, void *info)
 
         /* ── Blend cursor onto display surface ───────────────────────── */
         if (cursor) {
+            fprintf(stderr, "[framebufferd] cursor at %d,%d (%ux%u) surf=%p\n",
+                    cx, cy, cw, ch, (void*)cursor);
             IOSurfaceLock(cursor, 0, NULL);
             uint8_t *cur_base = (uint8_t *)IOSurfaceGetBaseAddress(cursor);
             size_t cur_stride = IOSurfaceGetBytesPerRow(cursor);
@@ -226,14 +228,17 @@ static void *mach_server_thread(void *arg)
             g_cursor_surface = client_surface;
             g_cursor_w = 64; g_cursor_h = 64;
             /* Try to parse w/h from JSON */
-            sscanf(msg.json, "%*[^w]\"w\":%u,\"h\":%u",
+            sscanf(msg.json, "%*[^w]w\":%u,\"h\":%u",
                    &g_cursor_w, &g_cursor_h);
             pthread_mutex_unlock(&g_cursor_lock);
         } else if (strstr(msg.json, "\"op\":\"cursor_move\"")) {
             /* Cursor move — update position */
             pthread_mutex_lock(&g_cursor_lock);
-            sscanf(msg.json, "%*[^x]\"x\":%d,\"y\":%d",
-                   &g_cursor_x, &g_cursor_y);
+            int parsed = sscanf(msg.json, "%*[^x]x\":%d,\"y\":%d",
+                                &g_cursor_x, &g_cursor_y);
+            fprintf(stderr, "[framebufferd] cursor_move parsed=%d "
+                    "x=%d y=%d json=%.80s\n",
+                    parsed, g_cursor_x, g_cursor_y, msg.json);
             pthread_mutex_unlock(&g_cursor_lock);
             if (client_surface) CFRelease(client_surface);
         } else if (client_surface) {

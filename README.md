@@ -1,6 +1,10 @@
 # iland
 
-Compat layer for running Wayland compositors and clients directly on macOS.
+iland is a library that implements the platform functionality required by Wayland compositors on macOS.
+
+It is not an application, desktop environment, compositor, or display server. Instead, iland provides the low-level services that Wayland compositors expect from the operating system, allowing them to run natively on macOS.
+
+No AppKit, Cocoa, Aqua, or WindowServer integration is required.
 
 Produces `libwayland-mac.dylib`.
 

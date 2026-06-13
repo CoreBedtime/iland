@@ -1291,6 +1291,11 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReq *req,
     fprintf(stderr, "[atomic-commit] enter req=%p flags=0x%x user_data=%p props=%u\n",
             (void*)req, flags, user_data, req->prop_count);
 
+    /* Find cursor plane props for tracking position changes */
+    obj_props_t *cursor_props = NULL;
+    for (int j = 0; j < g_obj_prop_count; j++)
+        if (g_obj_props[j].obj_id == 2) { cursor_props = &g_obj_props[j]; break; }
+
     /* Apply all property changes */
     uint32_t new_fb_id = 0;
     uint32_t new_plane_id = 0;
@@ -1322,33 +1327,65 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReq *req,
 
         set_obj_prop(op, prop_id, val);
 
-        /* Track FB_ID changes for page flip */
+        /* Debug cursor plane CRTC_X/CRTC_Y */
+        if (obj_id == 2 && (strcmp(pname, "CRTC_X") == 0 ||
+                            strcmp(pname, "CRTC_Y") == 0))
+            fprintf(stderr, "[atomic-commit]  >>> CURSOR %s = %lld\n",
+                    pname, (long long)val);
+
+        /* Track/send FB_ID changes */
         if (strcmp(pname, "FB_ID") == 0) {
-            new_fb_id = (uint32_t)val;
-            new_plane_id = obj_id;
-            fprintf(stderr, "[atomic-commit]  found FB_ID=%u plane=%u\n",
-                    new_fb_id, new_plane_id);
+            bool is_cursor = (obj_id == 2);
+            fprintf(stderr, "[atomic-commit]  FB_ID=%u plane=%u %s\n",
+                    (uint32_t)val, obj_id,
+                    is_cursor ? "(cursor)" : "");
+            IOSurfaceRef surf = fb_id_to_surface((uint32_t)val);
+            if (surf) {
+                mach_port_t surface_port = IOSurfaceCreateMachPort(surf);
+                char buf[256];
+                if (is_cursor) {
+                    snprintf(buf, sizeof(buf),
+                             "{\"op\":\"cursor_set\",\"crtc\":1,\"w\":64,\"h\":64}");
+                } else {
+                    snprintf(buf, sizeof(buf),
+                             "{\"op\":\"page_flip\",\"crtc\":1,\"fb\":%u,\"flags\":%u}",
+                             (uint32_t)val, flags);
+                    g_state.crtc_fb_id = (uint32_t)val;
+                }
+                drm_send_json_with_surface(buf, surface_port);
+                if (surface_port != MACH_PORT_NULL)
+                    mach_port_deallocate(mach_task_self(), surface_port);
+            } else {
+                fprintf(stderr, "[atomic-commit] no surface for fb_id %u\n",
+                        (uint32_t)val);
+            }
+            if (!is_cursor)
+                new_fb_id = (uint32_t)val;
         }
     }
 
-    /* Send surface to framebufferd if we have a framebuffer */
+    /* Send page flip event for primary plane if detected */
     if (new_fb_id > 0) {
-        fprintf(stderr, "[atomic-commit] page_flip fb_id=%u user_data=%p\n",
-                new_fb_id, user_data);
-        IOSurfaceRef surf = fb_id_to_surface(new_fb_id);
-        if (surf) {
-            mach_port_t surface_port = IOSurfaceCreateMachPort(surf);
-            char buf[256];
-            snprintf(buf, sizeof(buf),
-                     "{\"op\":\"page_flip\",\"crtc\":1,\"fb\":%u,\"flags\":%u}",
-                     new_fb_id, flags);
-            drm_send_json_with_surface(buf, surface_port);
-            if (surface_port != MACH_PORT_NULL)
-                mach_port_deallocate(mach_task_self(), surface_port);
-        } else {
-            fprintf(stderr, "[atomic-commit] no surface for fb_id %u\n", new_fb_id);
-        }
         g_state.crtc_fb_id = new_fb_id;
+    }
+
+    /* Forward cursor plane position changes to framebufferd */
+    if (cursor_props) {
+        static int prev_cx = 0, prev_cy = 0;
+        uint64_t cx = get_obj_prop(cursor_props, lookup_prop_id("CRTC_X"));
+        uint64_t cy = get_obj_prop(cursor_props, lookup_prop_id("CRTC_Y"));
+        uint64_t fb = get_obj_prop(cursor_props, lookup_prop_id("FB_ID"));
+        if (fb > 0 && ((int)cx != prev_cx || (int)cy != prev_cy)) {
+            prev_cx = (int)cx;
+            prev_cy = (int)cy;
+            char buf[128];
+            snprintf(buf, sizeof(buf),
+                     "{\"op\":\"cursor_move\",\"crtc\":1,\"x\":%d,\"y\":%d}",
+                     prev_cx, prev_cy);
+            drm_send_json(buf);
+            fprintf(stderr, "[atomic-commit] cursor_move x=%d y=%d\n",
+                    prev_cx, prev_cy);
+        }
     }
 
     /* Always signal page flip completion when PAGE_FLIP_EVENT is requested,

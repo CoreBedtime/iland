@@ -14,6 +14,33 @@
 #include <IOKit/hid/IOHIDManager.h>
 #include <IOKit/hid/IOHIDKeys.h>
 
+/* MultitouchSupport private framework types */
+typedef struct { float x, y; } MTPoint;
+typedef struct { MTPoint position; MTPoint velocity; } MTVector;
+enum {
+    MTTouchStateNotTracking = 0, MTTouchStateStartInRange = 1,
+    MTTouchStateHoverInRange = 2, MTTouchStateMakeTouch = 3,
+    MTTouchStateTouching = 4, MTTouchStateBreakTouch = 5,
+    MTTouchStateLingerInRange = 6, MTTouchStateOutOfRange = 7,
+};
+typedef int MTTouchState;
+typedef struct {
+    int frame; double timestamp; int identifier; MTTouchState state;
+    int fingerId; int handId; MTVector normalizedPosition;
+    float total; float pressure; float angle;
+    float majorAxis; float minorAxis; MTVector absolutePosition;
+    int field14; int field15; float density;
+} MTTouch;
+typedef void *MTDeviceRef;
+typedef void (*MTFrameCallback)(MTDeviceRef, MTTouch[], int, double, int);
+
+bool MTDeviceIsAvailable(void);
+MTDeviceRef MTDeviceCreateDefault(void);
+int MTDeviceStart(MTDeviceRef, int);
+int MTDeviceStop(MTDeviceRef);
+void MTDeviceRelease(MTDeviceRef);
+void MTRegisterContactFrameCallback(MTDeviceRef, MTFrameCallback);
+
 #define LIBINPUT_KEY_STATE_RELEASED 0
 #define LIBINPUT_KEY_STATE_PRESSED 1
 #define LIBINPUT_BUTTON_STATE_RELEASED 0
@@ -35,6 +62,12 @@ static void handle_signal(int sig)
 }
 
 static IOHIDManagerRef g_hid_manager;
+
+/* multitouch state */
+static MTDeviceRef g_mt_device;
+static int g_mt_finger_id = -1;
+static float g_mt_prev_x, g_mt_prev_y;
+static bool g_mt_touching;
 
 static pthread_t g_mach_thread;
 static pthread_t g_hid_thread;
@@ -322,6 +355,33 @@ static void accum_motion(double dx, double dy)
     pthread_mutex_unlock(&g_accel_lock);
 }
 
+static float mt_sensitivity = 1800.0f;
+
+static void mt_contact_frame(MTDeviceRef device, MTTouch touches[],
+                              int numTouches, double timestamp, int frame)
+{
+    (void)device;(void)timestamp;(void)frame;
+    for (int i = 0; i < numTouches; i++) {
+        MTTouch *t = &touches[i];
+        if (t->state == MTTouchStateMakeTouch ||
+            t->state == MTTouchStateTouching) {
+            float nx = t->normalizedPosition.position.x;
+            float ny = t->normalizedPosition.position.y;
+            if (g_mt_touching) {
+                float dx = (nx - g_mt_prev_x) * mt_sensitivity;
+                float dy = (g_mt_prev_y - ny) * mt_sensitivity;
+                if (dx != 0.0f || dy != 0.0f)
+                    accum_motion((double)dx, (double)dy);
+            }
+            g_mt_prev_x = nx;
+            g_mt_prev_y = ny;
+            g_mt_touching = true;
+            return;
+        }
+    }
+    g_mt_touching = false;
+}
+
 static void hid_value_cb(void *context, IOReturn result, void *sender,
                           IOHIDValueRef value)
 {
@@ -466,6 +526,19 @@ static void *hid_thread(void *arg)
 
     fprintf(stderr, "[inputd] HID capture started\n");
 
+    if (MTDeviceIsAvailable()) {
+        g_mt_device = MTDeviceCreateDefault();
+        if (g_mt_device) {
+            MTRegisterContactFrameCallback(g_mt_device, mt_contact_frame);
+            MTDeviceStart(g_mt_device, 0);
+            fprintf(stderr, "[inputd] multitouch started\n");
+        } else {
+            fprintf(stderr, "[inputd] MTDeviceCreateDefault failed\n");
+        }
+    } else {
+        fprintf(stderr, "[inputd] multitouch not available\n");
+    }
+
     CFRunLoopTimerRef mtimer = CFRunLoopTimerCreate(
         kCFAllocatorDefault, CFAbsoluteTimeGetCurrent(),
         1.0 / 250.0, 0, 0, motion_timer_cb, NULL);
@@ -474,6 +547,11 @@ static void *hid_thread(void *arg)
     CFRunLoopRun();
 
     CFRelease(mtimer);
+    if (g_mt_device) {
+        MTDeviceStop(g_mt_device);
+        MTDeviceRelease(g_mt_device);
+        g_mt_device = NULL;
+    }
     IOHIDManagerClose(g_hid_manager, kIOHIDManagerOptionNone);
     CFRelease(g_hid_manager);
     return NULL;
