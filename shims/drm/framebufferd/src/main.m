@@ -445,18 +445,46 @@ int main(void)
         pthread_create(&thread, NULL, mach_server_thread, NULL);
         pthread_detach(thread);
 
-        /* ── 60 fps render loop ─────────────────────────────────────── */
+        /* ── Determine display refresh rate using CAWindowServerDisplay ── */
+        double refreshRate = 60.0;
+        if (g_display) {
+            float idealRate = 0.0f;
+            float maxRate = 0.0f;
+            SEL selIdeal = NSSelectorFromString(@"idealRefreshRate");
+            SEL selMax = NSSelectorFromString(@"maximumRefreshRate");
+
+            if ([g_display respondsToSelector:selIdeal]) {
+                idealRate = ((float (*)(id, SEL))objc_msgSend)(g_display, selIdeal);
+            }
+            if ([g_display respondsToSelector:selMax]) {
+                maxRate = ((float (*)(id, SEL))objc_msgSend)(g_display, selMax);
+            }
+
+            if (idealRate > 0.0f) {
+                refreshRate = idealRate;
+            } else if (maxRate > 0.0f) {
+                refreshRate = maxRate;
+            } else {
+                /* Default/Fallback for ProMotion or unknown display */
+                refreshRate = 120.0;
+            }
+        }
+        if (refreshRate < 60.0) {
+            refreshRate = 60.0;
+        }
+
+        /* ── Render loop (synced to display refresh rate) ───────────── */
         CFRunLoopTimerRef timer = CFRunLoopTimerCreate(
             kCFAllocatorDefault,
             CFAbsoluteTimeGetCurrent(),
-            1.0 / 60.0,
+            1.0 / refreshRate,
             0, 0,
             TimerCallback,
             NULL);
         CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer,
                           kCFRunLoopCommonModes);
 
-        printf("[framebufferd] render loop started (Accelerate CPU compositing)\n");
+        printf("[framebufferd] render loop started at %.1f FPS (Accelerate CPU compositing)\n", refreshRate);
         CFRunLoopRun();
 
         CFRelease(timer);

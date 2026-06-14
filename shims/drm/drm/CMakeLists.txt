@@ -8,4 +8,5 @@ target_include_directories(drm PUBLIC
 target_link_libraries(drm PUBLIC
   "-framework CoreFoundation"
   "-framework IOSurface"
+  "-framework CoreGraphics"
 )

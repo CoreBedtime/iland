@@ -16,9 +16,31 @@
 /* ── dynamic mode table (reads display resolution from plist) ────────── */
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CoreGraphics.h>
 
 static drmModeModeInfo g_modes[4];
 static int g_mode_count;
+
+static uint32_t get_display_refresh_rate(void)
+{
+    uint32_t refresh = 60;
+    CGDirectDisplayID main_display = CGMainDisplayID();
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(main_display);
+    if (mode) {
+        double r = CGDisplayModeGetRefreshRate(mode);
+        if (r > 0.0) {
+            refresh = (uint32_t)(r + 0.5);
+        } else {
+            /* ProMotion displays return 0, default to 120 */
+            refresh = 120;
+        }
+        CGDisplayModeRelease(mode);
+    }
+    if (refresh < 60) {
+        refresh = 60;
+    }
+    return refresh;
+}
 
 static void init_modes(void)
 {
@@ -67,27 +89,29 @@ found:
     }
     if (stream) CFRelease(stream);
     if (url) CFRelease(url);
+    uint32_t refresh_rate = get_display_refresh_rate();
+
     /* Native mode */
     drmModeModeInfo *m = &g_modes[g_mode_count++];
     memset(m, 0, sizeof(*m));
-    m->clock       = (pw * ph * 60 + 500) / 1000;
+    m->clock       = (pw * ph * refresh_rate + 500) / 1000;
     m->hdisplay    = pw;  m->hsync_start = pw + 88;
     m->hsync_end   = pw + 88 + 44;  m->htotal = pw + 88 + 44 + 168;
     m->vdisplay    = ph;  m->vsync_start = ph + 4;
     m->vsync_end   = ph + 4 + 5;   m->vtotal = ph + 4 + 5 + 36;
-    m->vrefresh    = 60;
+    m->vrefresh    = refresh_rate;
     m->type        = 0;
     snprintf(m->name, sizeof(m->name), "%ux%u", pw, ph);
 
     /* 1920x1080 fallback */
     m = &g_modes[g_mode_count++];
     memset(m, 0, sizeof(*m));
-    m->clock       = 148500;
+    m->clock       = (1920 * 1080 * refresh_rate + 500) / 1000;
     m->hdisplay    = 1920; m->hsync_start = 2008;
     m->hsync_end   = 2052; m->htotal = 2200;
     m->vdisplay    = 1080; m->vsync_start = 1084;
     m->vsync_end   = 1089; m->vtotal = 1125;
-    m->vrefresh    = 60;
+    m->vrefresh    = refresh_rate;
     m->type        = 0;
     snprintf(m->name, sizeof(m->name), "1920x1080");
 }
