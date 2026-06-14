@@ -3,7 +3,7 @@
 
   # iland
 
-  **_Wayland compositor platform support for macOS_**
+  **_Wayland compositor support library for macOS_**
 </div>
 
 # What is this?
