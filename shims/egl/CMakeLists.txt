@@ -9,4 +9,5 @@ target_link_libraries(egl-shim PUBLIC
   gbm
   "-framework IOSurface"
   "-framework CoreFoundation"
+  "-framework Accelerate"
 )

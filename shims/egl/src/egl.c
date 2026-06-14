@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <IOSurface/IOSurface.h>
+#include <Accelerate/Accelerate.h>
 
 static void *g_angle_handle = NULL;
 
@@ -42,6 +43,9 @@ static inline uint32_t rgba_to_bgra(uint32_t rgba)
 {
     return (rgba & 0xFF00FF00u) | ((rgba >> 16) & 0xFFu) | ((rgba & 0xFFu) << 16);
 }
+
+/* Permute map: RGBA → BGRA (swap byte 0 and byte 2) */
+static const uint8_t kRGBAToBGRAMap[4] = { 2, 1, 0, 3 };
 
 static int load_angle(void)
 {
@@ -163,8 +167,16 @@ EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint *attrib_list,
         n_attribs += 1;
     }
 
-    EGLint *mod_attribs = malloc((n_attribs + 1) * sizeof(EGLint));
-    if (!mod_attribs) return EGL_FALSE;
+    /* Stack buffer for typical attrib lists (up to 32 pairs) */
+    EGLint stack_buf[65];
+    EGLint *mod_attribs;
+    int use_heap = ((n_attribs + 1) > (int)(sizeof(stack_buf) / sizeof(stack_buf[0])));
+    if (use_heap) {
+        mod_attribs = malloc((n_attribs + 1) * sizeof(EGLint));
+        if (!mod_attribs) return EGL_FALSE;
+    } else {
+        mod_attribs = stack_buf;
+    }
 
     if (attrib_list) {
         memcpy(mod_attribs, attrib_list, (n_attribs + 1) * sizeof(EGLint));
@@ -178,7 +190,7 @@ EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint *attrib_list,
 
     EGLBoolean ret = real_eglChooseConfig(sd->angle_display, mod_attribs,
                                            configs, config_size, num_config);
-    free(mod_attribs);
+    if (use_heap) free(mod_attribs);
     return ret;
 }
 
@@ -327,16 +339,25 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface)
     if (!ret) return ret;
 
     IOSurfaceLock(iosurf, 0, NULL);
-    uint32_t *src32 = (uint32_t *)g_pixels;
-    uint32_t *dst32 = (uint32_t *)IOSurfaceGetBaseAddress(iosurf);
-    size_t dst_pitch = IOSurfaceGetBytesPerRow(iosurf) / 4;
+    uint8_t *dst8 = (uint8_t *)IOSurfaceGetBaseAddress(iosurf);
+    size_t dst_pitch_bytes = IOSurfaceGetBytesPerRow(iosurf);
+    const uint8_t *src8 = (const uint8_t *)g_pixels;
 
+    /* Copy rows with vertical flip (source is bottom-up from GL) */
     for (uint32_t y = 0; y < h; y++) {
-        uint32_t *s = src32 + (h - 1 - y) * w;
-        uint32_t *d = dst32 + y * dst_pitch;
-        for (uint32_t x = 0; x < w; x++)
-            d[x] = rgba_to_bgra(s[x]);
+        const uint8_t *s = src8 + (size_t)(h - 1 - y) * w * 4;
+        uint8_t *d = dst8 + (size_t)y * dst_pitch_bytes;
+        memcpy(d, s, (size_t)w * 4);
     }
+
+    /* Channel swap RGBA→BGRA using Accelerate (SIMD on Apple Silicon) */
+    vImage_Buffer buf = {
+        .data     = dst8,
+        .width    = w,
+        .height   = h,
+        .rowBytes = dst_pitch_bytes,
+    };
+    vImagePermuteChannels_ARGB8888(&buf, &buf, kRGBAToBGRAMap, 0);
 
     IOSurfaceUnlock(iosurf, 0, NULL);
 

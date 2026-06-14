@@ -900,6 +900,46 @@ static uint32_t lookup_prop_id(const char *name)
     return 0;
 }
 
+/* Cached property IDs — looked up once, reused in hot paths */
+static struct {
+    uint32_t fb_id;
+    uint32_t crtc_x;
+    uint32_t crtc_y;
+    uint32_t crtc_w;
+    uint32_t crtc_h;
+    uint32_t src_x;
+    uint32_t src_y;
+    uint32_t src_w;
+    uint32_t src_h;
+    uint32_t crtc_id;
+    uint32_t active;
+    uint32_t mode_id;
+    uint32_t dpms;
+    uint32_t type;
+    uint32_t in_formats;
+} g_cached_prop_ids;
+
+static void ensure_cached_prop_ids(void)
+{
+    if (g_cached_prop_ids.fb_id) return; /* already cached */
+    ensure_properties();
+    g_cached_prop_ids.fb_id      = lookup_prop_id("FB_ID");
+    g_cached_prop_ids.crtc_x     = lookup_prop_id("CRTC_X");
+    g_cached_prop_ids.crtc_y     = lookup_prop_id("CRTC_Y");
+    g_cached_prop_ids.crtc_w     = lookup_prop_id("CRTC_W");
+    g_cached_prop_ids.crtc_h     = lookup_prop_id("CRTC_H");
+    g_cached_prop_ids.src_x      = lookup_prop_id("SRC_X");
+    g_cached_prop_ids.src_y      = lookup_prop_id("SRC_Y");
+    g_cached_prop_ids.src_w      = lookup_prop_id("SRC_W");
+    g_cached_prop_ids.src_h      = lookup_prop_id("SRC_H");
+    g_cached_prop_ids.crtc_id    = lookup_prop_id("CRTC_ID");
+    g_cached_prop_ids.active     = lookup_prop_id("ACTIVE");
+    g_cached_prop_ids.mode_id    = lookup_prop_id("MODE_ID");
+    g_cached_prop_ids.dpms       = lookup_prop_id("DPMS");
+    g_cached_prop_ids.type       = lookup_prop_id("type");
+    g_cached_prop_ids.in_formats = lookup_prop_id("IN_FORMATS");
+}
+
 /* Find or create object property record */
 static obj_props_t *get_obj_props(uint32_t obj_id, uint32_t obj_type)
 {
@@ -940,52 +980,52 @@ static uint64_t get_obj_prop(obj_props_t *op, uint32_t prop_id)
 /* ensure each object has the right default properties */
 static void ensure_obj_properties(void)
 {
-    ensure_properties();
+    ensure_cached_prop_ids();
 
     /* CRTC 1: default ACTIVE=1 */
     obj_props_t *cr = get_obj_props(1, DRM_MODE_OBJECT_CRTC);
     if (cr->prop_count == 0) {
-        set_obj_prop(cr, lookup_prop_id("ACTIVE"), 1);
-        set_obj_prop(cr, lookup_prop_id("MODE_ID"), 0);
+        set_obj_prop(cr, g_cached_prop_ids.active, 1);
+        set_obj_prop(cr, g_cached_prop_ids.mode_id, 0);
     }
 
     /* Connector 1: default DPMS=0, CRTC_ID=0 */
     obj_props_t *co = get_obj_props(1, DRM_MODE_OBJECT_CONNECTOR);
     if (co->prop_count == 0) {
-        set_obj_prop(co, lookup_prop_id("DPMS"), 0);
-        set_obj_prop(co, lookup_prop_id("CRTC_ID"), 0);
+        set_obj_prop(co, g_cached_prop_ids.dpms, 0);
+        set_obj_prop(co, g_cached_prop_ids.crtc_id, 0);
     }
 
     /* Primary plane (1) */
     obj_props_t *pp = get_obj_props(1, DRM_MODE_OBJECT_PLANE);
     if (pp->prop_count == 0) {
-        set_obj_prop(pp, lookup_prop_id("type"), DRM_PLANE_TYPE_PRIMARY);
-        set_obj_prop(pp, lookup_prop_id("FB_ID"), 0);
-        set_obj_prop(pp, lookup_prop_id("CRTC_ID"), 0);
-        set_obj_prop(pp, lookup_prop_id("CRTC_X"), 0);
-        set_obj_prop(pp, lookup_prop_id("CRTC_Y"), 0);
-        set_obj_prop(pp, lookup_prop_id("CRTC_W"), 0);
-        set_obj_prop(pp, lookup_prop_id("CRTC_H"), 0);
-        set_obj_prop(pp, lookup_prop_id("SRC_X"), 0);
-        set_obj_prop(pp, lookup_prop_id("SRC_Y"), 0);
-        set_obj_prop(pp, lookup_prop_id("SRC_W"), 0);
-        set_obj_prop(pp, lookup_prop_id("SRC_H"), 0);
+        set_obj_prop(pp, g_cached_prop_ids.type, DRM_PLANE_TYPE_PRIMARY);
+        set_obj_prop(pp, g_cached_prop_ids.fb_id, 0);
+        set_obj_prop(pp, g_cached_prop_ids.crtc_id, 0);
+        set_obj_prop(pp, g_cached_prop_ids.crtc_x, 0);
+        set_obj_prop(pp, g_cached_prop_ids.crtc_y, 0);
+        set_obj_prop(pp, g_cached_prop_ids.crtc_w, 0);
+        set_obj_prop(pp, g_cached_prop_ids.crtc_h, 0);
+        set_obj_prop(pp, g_cached_prop_ids.src_x, 0);
+        set_obj_prop(pp, g_cached_prop_ids.src_y, 0);
+        set_obj_prop(pp, g_cached_prop_ids.src_w, 0);
+        set_obj_prop(pp, g_cached_prop_ids.src_h, 0);
     }
 
     /* Cursor plane (2) */
     obj_props_t *cp = get_obj_props(2, DRM_MODE_OBJECT_PLANE);
     if (cp->prop_count == 0) {
-        set_obj_prop(cp, lookup_prop_id("type"), DRM_PLANE_TYPE_CURSOR);
-        set_obj_prop(cp, lookup_prop_id("FB_ID"), 0);
-        set_obj_prop(cp, lookup_prop_id("CRTC_ID"), 0);
-        set_obj_prop(cp, lookup_prop_id("CRTC_X"), 0);
-        set_obj_prop(cp, lookup_prop_id("CRTC_Y"), 0);
-        set_obj_prop(cp, lookup_prop_id("CRTC_W"), 64);
-        set_obj_prop(cp, lookup_prop_id("CRTC_H"), 64);
-        set_obj_prop(cp, lookup_prop_id("SRC_X"), 0);
-        set_obj_prop(cp, lookup_prop_id("SRC_Y"), 0);
-        set_obj_prop(cp, lookup_prop_id("SRC_W"), 64);
-        set_obj_prop(cp, lookup_prop_id("SRC_H"), 64);
+        set_obj_prop(cp, g_cached_prop_ids.type, DRM_PLANE_TYPE_CURSOR);
+        set_obj_prop(cp, g_cached_prop_ids.fb_id, 0);
+        set_obj_prop(cp, g_cached_prop_ids.crtc_id, 0);
+        set_obj_prop(cp, g_cached_prop_ids.crtc_x, 0);
+        set_obj_prop(cp, g_cached_prop_ids.crtc_y, 0);
+        set_obj_prop(cp, g_cached_prop_ids.crtc_w, 64);
+        set_obj_prop(cp, g_cached_prop_ids.crtc_h, 64);
+        set_obj_prop(cp, g_cached_prop_ids.src_x, 0);
+        set_obj_prop(cp, g_cached_prop_ids.src_y, 0);
+        set_obj_prop(cp, g_cached_prop_ids.src_w, 64);
+        set_obj_prop(cp, g_cached_prop_ids.src_h, 64);
     }
 }
 
@@ -1010,14 +1050,13 @@ static uint32_t create_in_formats_blob(void)
     return id;
 }
 
+static uint32_t g_in_formats_blob_id;
+
 static uint32_t get_or_create_in_formats_blob(void)
 {
-    for (int i = 0; i < MAX_BLOBS; i++)
-        if (g_blob_data[i] != NULL &&
-            g_blob_sizes[i] == sizeof(g_in_formats) &&
-            memcmp(g_blob_data[i], g_in_formats, sizeof(g_in_formats)) == 0)
-            return g_blob_ids[i];
-    return create_in_formats_blob();
+    if (g_in_formats_blob_id) return g_in_formats_blob_id;
+    g_in_formats_blob_id = create_in_formats_blob();
+    return g_in_formats_blob_id;
 }
 
 /* ── property API ────────────────────────────────────────────────────── */
@@ -1198,6 +1237,7 @@ drmModePlanePtr drmModeGetPlane(int fd, uint32_t plane_id)
 {
     if (check_fd(fd) < 0) return NULL;
     ensure_obj_properties();
+    ensure_cached_prop_ids();
 
     drmModePlane *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
@@ -1208,7 +1248,7 @@ drmModePlanePtr drmModeGetPlane(int fd, uint32_t plane_id)
     p->crtc_id    = 1;
     p->fb_id      = (uint32_t)get_obj_prop(
                         get_obj_props(plane_id, DRM_MODE_OBJECT_PLANE),
-                        lookup_prop_id("FB_ID"));
+                        g_cached_prop_ids.fb_id);
 
     switch (plane_id) {
     case 1: /* primary */
@@ -1288,9 +1328,6 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReq *req,
 
     ensure_obj_properties();
 
-    fprintf(stderr, "[atomic-commit] enter req=%p flags=0x%x user_data=%p props=%u\n",
-            (void*)req, flags, user_data, req->prop_count);
-
     /* Find cursor plane props for tracking position changes */
     obj_props_t *cursor_props = NULL;
     for (int j = 0; j < g_obj_prop_count; j++)
@@ -1299,46 +1336,25 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReq *req,
     /* Apply all property changes */
     uint32_t new_fb_id = 0;
     uint32_t new_plane_id = 0;
-    bool     page_flip = (flags & DRM_MODE_PAGE_FLIP_EVENT);
-    (void)page_flip;
 
     for (int i = 0; i < req->prop_count; i++) {
         uint32_t obj_id  = req->obj_ids[i];
         uint32_t prop_id = req->prop_ids[i];
         uint64_t val     = req->values[i];
 
-        const char *pname = (prop_id > 0 && prop_id <= (uint32_t)g_prop_count)
-                          ? g_props[prop_id - 1].name : "???";
-
-        fprintf(stderr, "[atomic-commit]  prop[%d] obj=%u prop=%u (%s) val=%llu\n",
-                i, obj_id, prop_id, pname, (unsigned long long)val);
-
-        /* Find the object's prop record (matched by obj_id only —
-         * atomic API doesn't carry obj_type in the request)         */
+        /* Find the object's prop record (matched by obj_id only) */
         obj_props_t *op = NULL;
         for (int j = 0; j < g_obj_prop_count; j++)
             if (g_obj_props[j].obj_id == obj_id) {
                 op = &g_obj_props[j]; break;
             }
-        if (!op) {
-            fprintf(stderr, "[atomic-commit]  no obj prop record for obj=%u\n", obj_id);
-            continue;
-        }
+        if (!op) continue;
 
         set_obj_prop(op, prop_id, val);
 
-        /* Debug cursor plane CRTC_X/CRTC_Y */
-        if (obj_id == 2 && (strcmp(pname, "CRTC_X") == 0 ||
-                            strcmp(pname, "CRTC_Y") == 0))
-            fprintf(stderr, "[atomic-commit]  >>> CURSOR %s = %lld\n",
-                    pname, (long long)val);
-
         /* Track/send FB_ID changes */
-        if (strcmp(pname, "FB_ID") == 0) {
+        if (prop_id == g_cached_prop_ids.fb_id) {
             bool is_cursor = (obj_id == 2);
-            fprintf(stderr, "[atomic-commit]  FB_ID=%u plane=%u %s\n",
-                    (uint32_t)val, obj_id,
-                    is_cursor ? "(cursor)" : "");
             IOSurfaceRef surf = fb_id_to_surface((uint32_t)val);
             if (surf) {
                 mach_port_t surface_port = IOSurfaceCreateMachPort(surf);
@@ -1355,9 +1371,6 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReq *req,
                 drm_send_json_with_surface(buf, surface_port);
                 if (surface_port != MACH_PORT_NULL)
                     mach_port_deallocate(mach_task_self(), surface_port);
-            } else {
-                fprintf(stderr, "[atomic-commit] no surface for fb_id %u\n",
-                        (uint32_t)val);
             }
             if (!is_cursor)
                 new_fb_id = (uint32_t)val;
@@ -1372,9 +1385,9 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReq *req,
     /* Forward cursor plane position changes to framebufferd */
     if (cursor_props) {
         static int prev_cx = 0, prev_cy = 0;
-        uint64_t cx = get_obj_prop(cursor_props, lookup_prop_id("CRTC_X"));
-        uint64_t cy = get_obj_prop(cursor_props, lookup_prop_id("CRTC_Y"));
-        uint64_t fb = get_obj_prop(cursor_props, lookup_prop_id("FB_ID"));
+        uint64_t cx = get_obj_prop(cursor_props, g_cached_prop_ids.crtc_x);
+        uint64_t cy = get_obj_prop(cursor_props, g_cached_prop_ids.crtc_y);
+        uint64_t fb = get_obj_prop(cursor_props, g_cached_prop_ids.fb_id);
         if (fb > 0 && ((int)cx != prev_cx || (int)cy != prev_cy)) {
             prev_cx = (int)cx;
             prev_cy = (int)cy;
@@ -1383,25 +1396,19 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReq *req,
                      "{\"op\":\"cursor_move\",\"crtc\":1,\"x\":%d,\"y\":%d}",
                      prev_cx, prev_cy);
             drm_send_json(buf);
-            fprintf(stderr, "[atomic-commit] cursor_move x=%d y=%d\n",
-                    prev_cx, prev_cy);
         }
     }
 
-    /* Always signal page flip completion when PAGE_FLIP_EVENT is requested,
-     * even with FB_ID=0 (initial modeset). Weston waits for this event
-     * to start its repaint loop. */
+    /* Signal page flip completion when PAGE_FLIP_EVENT is requested */
     if (flags & DRM_MODE_PAGE_FLIP_EVENT) {
         g_pending_flip_data = user_data;
         if (g_drm_event_pipe_write >= 0) {
             char byte = 1;
             ssize_t w = write(g_drm_event_pipe_write, &byte, 1);
-            fprintf(stderr, "[atomic-commit] wrote event byte (ret=%zd)\n", w);
             (void)w;
         }
     }
 
-    fprintf(stderr, "[atomic-commit] done ret=0\n");
     return 0;
 }
 
