@@ -477,7 +477,7 @@ int main(void)
         CFRunLoopTimerRef timer = CFRunLoopTimerCreate(
             kCFAllocatorDefault,
             CFAbsoluteTimeGetCurrent(),
-            1.0 / refreshRate,
+            1.0 / 120,
             0, 0,
             TimerCallback,
             NULL);
