@@ -187,9 +187,16 @@ static char **clean_environ(void) {
     return clean;
 }
 
+#define POSIX_SPAWN_PROC_TYPE_DAEMON_INTERACTIVE    0x00000400
+int posix_spawnattr_setprocesstype_np(posix_spawnattr_t *, const int);
+
 static int spawn_and_wait(const char *path, char *const argv[]) {
     pid_t pid;
-    int ret = posix_spawn(&pid, path, NULL, NULL, argv, clean_environ());
+    posix_spawnattr_t spattr;
+    posix_spawnattr_init(&spattr);
+    posix_spawnattr_setprocesstype_np(&spattr, POSIX_SPAWN_PROC_TYPE_DAEMON_INTERACTIVE);
+
+    int ret = posix_spawn(&pid, path, NULL, &spattr, argv, clean_environ());
     if (ret != 0) {
         fprintf(stderr, "[wayland-mac] posix_spawn %s: %s\n", path,
                 strerror(ret));
@@ -206,7 +213,11 @@ static int spawn_and_wait(const char *path, char *const argv[]) {
 
 static int spawn_background(const char *path, char *const argv[]) {
     pid_t pid;
-    int ret = posix_spawn(&pid, path, NULL, NULL, argv, clean_environ());
+    posix_spawnattr_t spattr;
+    posix_spawnattr_init(&spattr);
+    posix_spawnattr_setprocesstype_np(&spattr, POSIX_SPAWN_PROC_TYPE_DAEMON_INTERACTIVE);
+
+    int ret = posix_spawn(&pid, path, NULL, &spattr, argv, clean_environ());
     if (ret != 0) {
         fprintf(stderr, "[wayland-mac] posix_spawn %s: %s\n", path,
                 strerror(ret));
