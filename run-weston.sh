@@ -23,9 +23,10 @@ chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null
 echo "=== Cleaning up ==="
 sudo pkill -9 weston 2>/dev/null; sudo pkill -9 framebufferd 2>/dev/null
 sudo pkill -9 amfiexceptiond 2>/dev/null; sudo pkill -9 weston-terminal 2>/dev/null
-rm -f "$XDG_RUNTIME_DIR"/wayland-*
+sudo rm -f "$XDG_RUNTIME_DIR"/wayland-*
 
 # Generate weston.ini from template
+rm -f /tmp/weston-*.ini
 TEMP_WESTON_INI=$(mktemp /tmp/weston-XXXXXX.ini)
 sed "s|%SourceDirectory%|$SCRIPT_DIR|g" "$SCRIPT_DIR/weston.ini" > "$TEMP_WESTON_INI"
 

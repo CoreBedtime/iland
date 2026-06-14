@@ -117,47 +117,52 @@ static void TimerCallback(CFRunLoopTimerRef timer, void *info)
         uint8_t *dst_base = (uint8_t *)IOSurfaceGetBaseAddress(g_display_surface);
         size_t src_stride = IOSurfaceGetBytesPerRow(client);
         size_t dst_stride = IOSurfaceGetBytesPerRow(g_display_surface);
+        size_t row_bytes = copy_w * 4;
 
-        for (size_t y = 0; y < copy_h; y++)
-            memcpy(dst_base + y * dst_stride, src_base + y * src_stride, copy_w * 4);
+        /* Fast path: identical strides → single memcpy for entire block */
+        if (src_stride == dst_stride) {
+            memcpy(dst_base, src_base, copy_h * src_stride);
+        } else {
+            for (size_t y = 0; y < copy_h; y++)
+                memcpy(dst_base + y * dst_stride, src_base + y * src_stride, row_bytes);
+        }
 
         /* ── Blend cursor onto display surface ───────────────────────── */
         if (cursor) {
-            fprintf(stderr, "[framebufferd] cursor at %d,%d (%ux%u) surf=%p\n",
-                    cx, cy, cw, ch, (void*)cursor);
             IOSurfaceLock(cursor, 0, NULL);
             uint8_t *cur_base = (uint8_t *)IOSurfaceGetBaseAddress(cursor);
             size_t cur_stride = IOSurfaceGetBytesPerRow(cursor);
 
-            for (uint32_t y = 0; y < ch; y++) {
-                int dy = cy + (int)y;
-                if (dy < 0 || (size_t)dy >= dh) continue;
-                for (uint32_t x = 0; x < cw; x++) {
-                    int dx = cx + (int)x;
-                    if (dx < 0 || (size_t)dx >= dw) continue;
+            /* Clamp cursor to display bounds */
+            int sx = cx < 0 ? -cx : 0;
+            int sy = cy < 0 ? -cy : 0;
+            uint32_t sw = cw - (uint32_t)sx;
+            uint32_t sh = ch - (uint32_t)sy;
+            if (cx + (int)sw > (int)dw) sw = (uint32_t)((int)dw - cx);
+            if (cy + (int)sh > (int)dh) sh = (uint32_t)((int)dh - cy);
+            int dx = cx < 0 ? 0 : cx;
+            int dy = cy < 0 ? 0 : cy;
 
-                    uint32_t *cur_px = (uint32_t *)(cur_base + y * cur_stride + x * 4);
-                    uint32_t *dst_px = (uint32_t *)(dst_base + (size_t)dy * dst_stride + (size_t)dx * 4);
-
-                    uint32_t cp = *cur_px;
-                    uint32_t dp = *dst_px;
-
-                    uint8_t ca = (cp >> 24) & 0xFF;  /* ARGB -> A is MSB */
+            for (uint32_t y = 0; y < sh; y++) {
+                const uint8_t *s = cur_base + (size_t)(sy + y) * cur_stride + (size_t)sx * 4;
+                uint8_t *d = dst_base + (size_t)(dy + y) * dst_stride + (size_t)dx * 4;
+                uint32_t x = 0;
+                /* Skip fully transparent pixels in bulk */
+                while (x < sw && s[x * 4 + 3] == 0) x++;
+                /* Process row */
+                for (; x < sw; x++) {
+                    uint8_t ca = s[x * 4 + 3];
                     if (ca == 0) continue;
-
-                    uint8_t cr = (cp >> 16) & 0xFF;
-                    uint8_t cg = (cp >> 8)  & 0xFF;
-                    uint8_t cb =  cp        & 0xFF;
-
-                    uint8_t dr = (dp >> 16) & 0xFF;
-                    uint8_t dg = (dp >> 8)  & 0xFF;
-                    uint8_t db =  dp        & 0xFF;
-
-                    uint8_t nr = (uint8_t)(((int)cr * ca + dr * (255 - ca)) / 255);
-                    uint8_t ng = (uint8_t)(((int)cg * ca + dg * (255 - ca)) / 255);
-                    uint8_t nb = (uint8_t)(((int)cb * ca + db * (255 - ca)) / 255);
-
-                    *dst_px = (uint32_t)nb | ((uint32_t)ng << 8) | ((uint32_t)nr << 16) | ((uint32_t)0xFF << 24);
+                    if (ca == 255) {
+                        memcpy(&d[x * 4], &s[x * 4], 3);
+                        d[x * 4 + 3] = 0xFF;
+                    } else {
+                        int inv = 255 - ca;
+                        d[x * 4]     = (uint8_t)((s[x * 4]     * ca + d[x * 4]     * inv) / 255);
+                        d[x * 4 + 1] = (uint8_t)((s[x * 4 + 1] * ca + d[x * 4 + 1] * inv) / 255);
+                        d[x * 4 + 2] = (uint8_t)((s[x * 4 + 2] * ca + d[x * 4 + 2] * inv) / 255);
+                        d[x * 4 + 3] = 0xFF;
+                    }
                 }
             }
             IOSurfaceUnlock(cursor, 0, NULL);
@@ -208,17 +213,7 @@ static void *mach_server_thread(void *arg)
 
             client_surface = IOSurfaceLookupFromMachPort(msg.surface_port.name);
             mach_port_deallocate(mach_task_self(), msg.surface_port.name);
-
-            printf("[framebufferd] received surface=%p %zux%zu\n",
-                   (void*)client_surface,
-                   client_surface ? IOSurfaceGetWidth(client_surface) : 0,
-                   client_surface ? IOSurfaceGetHeight(client_surface) : 0);
         }
-
-        uint32_t len = msg.json_len < DRM_IPC_JSON_MAX
-                     ? msg.json_len : DRM_IPC_JSON_MAX - 1;
-        msg.json[len] = '\0';
-        printf("[framebufferd] %s\n", msg.json);
 
         /* Route message by operation type */
         if (strstr(msg.json, "\"op\":\"cursor_set\"")) {
@@ -234,11 +229,8 @@ static void *mach_server_thread(void *arg)
         } else if (strstr(msg.json, "\"op\":\"cursor_move\"")) {
             /* Cursor move — update position */
             pthread_mutex_lock(&g_cursor_lock);
-            int parsed = sscanf(msg.json, "%*[^x]x\":%d,\"y\":%d",
-                                &g_cursor_x, &g_cursor_y);
-            fprintf(stderr, "[framebufferd] cursor_move parsed=%d "
-                    "x=%d y=%d json=%.80s\n",
-                    parsed, g_cursor_x, g_cursor_y, msg.json);
+            sscanf(msg.json, "%*[^x]x\":%d,\"y\":%d",
+                   &g_cursor_x, &g_cursor_y);
             pthread_mutex_unlock(&g_cursor_lock);
             if (client_surface) CFRelease(client_surface);
         } else if (client_surface) {

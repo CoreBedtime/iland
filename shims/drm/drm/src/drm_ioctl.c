@@ -387,7 +387,6 @@ static int handle_atomic(void *arg)
     struct drm_mode_atomic *ka = arg;
 
     if (ka->count_objs == 0) {
-        /* Empty atomic commit is valid — just return success */
         return 0;
     }
 
@@ -406,8 +405,25 @@ static int handle_atomic(void *arg)
         return -1;
     }
 
-    drmModeAtomicReq *req = drmModeAtomicAlloc();
-    if (!req) { errno = ENOMEM; return -1; }
+    /* Pool of 4 pre-allocated atomic reqs — avoids malloc/free per frame.
+     * At 60fps with typical single-threaded use, this is always enough. */
+    static drmModeAtomicReq *pool[4];
+    static uint8_t pool_in_use;
+    drmModeAtomicReq *req = NULL;
+
+    for (int i = 0; i < 4; i++) {
+        if (!(pool_in_use & (1u << i))) {
+            pool_in_use |= (1u << i);
+            if (!pool[i]) pool[i] = drmModeAtomicAlloc();
+            req = pool[i];
+            break;
+        }
+    }
+    if (!req) {
+        /* All slots taken — fall back to heap */
+        req = drmModeAtomicAlloc();
+        if (!req) { errno = ENOMEM; return -1; }
+    }
 
     int flat_idx = 0;
     for (uint32_t i = 0; i < ka->count_objs; i++) {
@@ -421,6 +437,14 @@ static int handle_atomic(void *arg)
 
     int ret = drmModeAtomicCommit(DRM_VIRTUAL_FD, req, ka->flags,
                                   (void *)(uintptr_t)ka->user_data);
+
+    /* Return to pool if it came from there */
+    for (int i = 0; i < 4; i++) {
+        if (req == pool[i]) {
+            pool_in_use &= ~(1u << i);
+            return ret;
+        }
+    }
     drmModeAtomicFree(req);
     return ret;
 }
