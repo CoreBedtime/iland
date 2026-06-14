@@ -12,6 +12,6 @@ target_link_libraries(framebufferd PRIVATE
   "-framework IOSurface"
   "-framework IOKit"
   "-framework CoreGraphics"
-  "-framework CoreImage"
+  "-framework Accelerate"
 )
 

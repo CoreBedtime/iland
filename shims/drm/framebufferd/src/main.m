@@ -17,7 +17,7 @@
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
 #import <IOSurface/IOSurface.h>
-#import <CoreImage/CoreImage.h>
+#import <Accelerate/Accelerate.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
@@ -74,17 +74,19 @@ static void handle_signal(int sig)
     CFRunLoopStop(CFRunLoopGetCurrent());
 }
 
-/* ── CoreImage state ──────────────────────────────────────────────────── */
+/* ── Dirty tracking state ─────────────────────────────────────────────── */
+static volatile bool g_dirty = true;
 
-static CIContext *g_ci_context;
-
-/* ── 60 fps display timer (Metal — near-zero CPU work) ────────────────── */
+/* ── 60 fps display timer (Accelerate/vImage CPU compositing) ─────────── */
 
 static void TimerCallback(CFRunLoopTimerRef timer, void *info)
 {
     (void)timer; (void)info;
     @autoreleasepool {
-        if (!g_display || !g_display_surface || !g_ci_context) return;
+        if (!g_display || !g_display_surface) return;
+
+        if (!g_dirty) return;
+        g_dirty = false;
 
         /* ── Snapshot client + cursor surfaces under lock ────────────── */
         pthread_mutex_lock(&g_surface_lock);
@@ -104,28 +106,105 @@ static void TimerCallback(CFRunLoopTimerRef timer, void *info)
             return;
         }
 
-        /* ── CoreImage Compositing ──────────────────────────────────── */
-        CIImage *src = [CIImage imageWithIOSurface:client];
-        CGFloat dw = IOSurfaceGetWidth(g_display_surface);
-        CGFloat dh = IOSurfaceGetHeight(g_display_surface);
-
-        if (IOSurfaceGetWidth(client) != dw || IOSurfaceGetHeight(client) != dh) {
-            CIImage *bg = [CIImage imageWithColor:[CIColor colorWithRed:0 green:0 blue:0 alpha:1]];
-            bg = [bg imageByCroppingToRect:CGRectMake(0, 0, dw, dh)];
-            src = [src imageByCompositedOverImage:bg];
-        }
-
+        /* ── Accelerate / vImage Compositing ────────────────────────── */
+        IOSurfaceLock(client, kIOSurfaceLockReadOnly, NULL);
         if (cursor) {
-            CIImage *cursorImg = [CIImage imageWithIOSurface:cursor];
-            double cursor_y = (double)dh - (double)cy - (double)ch;
-            CIImage *positionedCursor = [cursorImg imageByApplyingTransform:CGAffineTransformMakeTranslation(cx, cursor_y)];
-            src = [positionedCursor imageByCompositedOverImage:src];
+            IOSurfaceLock(cursor, kIOSurfaceLockReadOnly, NULL);
+        }
+        IOSurfaceLock(g_display_surface, 0, NULL);
+
+        vImage_Buffer srcBuf = {
+            .data = IOSurfaceGetBaseAddress(client),
+            .width = IOSurfaceGetWidth(client),
+            .height = IOSurfaceGetHeight(client),
+            .rowBytes = IOSurfaceGetBytesPerRow(client)
+        };
+        vImage_Buffer dstBuf = {
+            .data = IOSurfaceGetBaseAddress(g_display_surface),
+            .width = IOSurfaceGetWidth(g_display_surface),
+            .height = IOSurfaceGetHeight(g_display_surface),
+            .rowBytes = IOSurfaceGetBytesPerRow(g_display_surface)
+        };
+
+        if (srcBuf.data && dstBuf.data) {
+            if (srcBuf.width == dstBuf.width && srcBuf.height == dstBuf.height) {
+                if (srcBuf.rowBytes == dstBuf.rowBytes) {
+                    memcpy(dstBuf.data, srcBuf.data, srcBuf.rowBytes * srcBuf.height);
+                } else {
+                    size_t bytesToCopy = srcBuf.width * 4;
+                    uint8_t *srcPtr = srcBuf.data;
+                    uint8_t *dstPtr = dstBuf.data;
+                    for (size_t y = 0; y < srcBuf.height; y++) {
+                        memcpy(dstPtr, srcPtr, bytesToCopy);
+                        srcPtr += srcBuf.rowBytes;
+                        dstPtr += dstBuf.rowBytes;
+                    }
+                }
+            } else {
+                vImageScale_ARGB8888(&srcBuf, &dstBuf, NULL, kvImageNoFlags);
+            }
+
+            if (cursor) {
+                vImage_Buffer cursorBuf = {
+                    .data = IOSurfaceGetBaseAddress(cursor),
+                    .width = IOSurfaceGetWidth(cursor),
+                    .height = IOSurfaceGetHeight(cursor),
+                    .rowBytes = IOSurfaceGetBytesPerRow(cursor)
+                };
+
+                if (cursorBuf.data) {
+                    int dw_int = (int)dstBuf.width;
+                    int dh_int = (int)dstBuf.height;
+
+                    int x_min = cx;
+                    int y_min = cy;
+                    int x_max = cx + (int)cw;
+                    int y_max = cy + (int)ch;
+
+                    if (x_min < 0) x_min = 0;
+                    if (y_min < 0) y_min = 0;
+                    if (x_max > dw_int) x_max = dw_int;
+                    if (y_max > dh_int) y_max = dh_int;
+
+                    int intersect_w = x_max - x_min;
+                    int intersect_h = y_max - y_min;
+
+                    if (intersect_w > 0 && intersect_h > 0) {
+                        uint8_t *dst_start = (uint8_t *)dstBuf.data + y_min * dstBuf.rowBytes + x_min * 4;
+                        vImage_Buffer subDstBuf = {
+                            .data = dst_start,
+                            .width = intersect_w,
+                            .height = intersect_h,
+                            .rowBytes = dstBuf.rowBytes
+                        };
+
+                        int cursor_x_offset = x_min - cx;
+                        int cursor_y_offset = y_min - cy;
+                        uint8_t *cursor_start = (uint8_t *)cursorBuf.data + cursor_y_offset * cursorBuf.rowBytes + cursor_x_offset * 4;
+
+                        vImage_Buffer subCursorBuf = {
+                            .data = cursor_start,
+                            .width = intersect_w,
+                            .height = intersect_h,
+                            .rowBytes = cursorBuf.rowBytes
+                        };
+
+                        vImagePremultipliedAlphaBlend_ARGB8888(
+                            &subCursorBuf,
+                            &subDstBuf,
+                            &subDstBuf,
+                            kvImageNoFlags
+                        );
+                    }
+                }
+            }
         }
 
-        [g_ci_context render:src
-                 toIOSurface:g_display_surface
-                      bounds:CGRectMake(0, 0, dw, dh)
-                  colorSpace:nil];
+        IOSurfaceUnlock(g_display_surface, 0, NULL);
+        if (cursor) {
+            IOSurfaceUnlock(cursor, kIOSurfaceLockReadOnly, NULL);
+        }
+        IOSurfaceUnlock(client, kIOSurfaceLockReadOnly, NULL);
 
         CFRelease(client);
         if (cursor) CFRelease(cursor);
@@ -181,12 +260,14 @@ static void *mach_server_thread(void *arg)
             /* Try to parse w/h from JSON */
             sscanf(msg.json, "%*[^w]w\":%u,\"h\":%u",
                    &g_cursor_w, &g_cursor_h);
+            g_dirty = true;
             pthread_mutex_unlock(&g_cursor_lock);
         } else if (strstr(msg.json, "\"op\":\"cursor_move\"")) {
             /* Cursor move — update position */
             pthread_mutex_lock(&g_cursor_lock);
             sscanf(msg.json, "%*[^x]x\":%d,\"y\":%d",
                    &g_cursor_x, &g_cursor_y);
+            g_dirty = true;
             pthread_mutex_unlock(&g_cursor_lock);
             if (client_surface) CFRelease(client_surface);
         } else if (client_surface) {
@@ -194,6 +275,7 @@ static void *mach_server_thread(void *arg)
             pthread_mutex_lock(&g_surface_lock);
             if (g_client_surface) CFRelease(g_client_surface);
             g_client_surface = client_surface;
+            g_dirty = true;
             pthread_mutex_unlock(&g_surface_lock);
         } else {
             if (client_surface) CFRelease(client_surface);
@@ -358,14 +440,6 @@ int main(void)
                dw, dh, g_display_surface ? "ok" : "FAILED");
         if (!g_display_surface) return 1;
 
-        /* ── Initialise CoreImage Context ────────────────────────────── */
-        g_ci_context = [CIContext contextWithOptions:nil];
-        if (!g_ci_context) {
-            fprintf(stderr, "[framebufferd] failed to create CIContext\n");
-            return 1;
-        }
-        printf("[framebufferd] CoreImage context ready\n");
-
         /* ── Start Mach server thread ───────────────────────────────── */
         pthread_t thread;
         pthread_create(&thread, NULL, mach_server_thread, NULL);
@@ -382,7 +456,7 @@ int main(void)
         CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer,
                           kCFRunLoopCommonModes);
 
-        printf("[framebufferd] render loop started (CoreImage GPU compositing)\n");
+        printf("[framebufferd] render loop started (Accelerate CPU compositing)\n");
         CFRunLoopRun();
 
         CFRelease(timer);
