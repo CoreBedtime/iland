@@ -1,4 +1,12 @@
-# iland
+<div align="center">
+  <img src=".resources/iland_mascot.png" alt="iland mascot" width="280">
+
+  # iland
+
+  **_Wayland compositor platform support for macOS_**
+</div>
+
+# What is this?
 
 iland is a library that implements the platform functionality required by Wayland compositors on macOS.
 
@@ -6,7 +14,11 @@ It is not an application, desktop environment, compositor, or display server. In
 
 No AppKit, Cocoa, Aqua, or WindowServer integration is required.
 
-Produces `libwayland-mac.dylib`.
+# Bullshit!
+
+I'm not kidding! Look for yourself!
+
+<img src=".resources/booting-to-weston.gif" alt="Booting to Weston on macOS" width="600">
 
 To build, you need these:
 ```
@@ -17,5 +29,6 @@ sudo port install libpixman cairo pango
 sudo port install libxkbcommon hidapi
 sudo port install pkgconfig meson ninja
 ```
+Produces `libwayland-mac.dylib`.
 
 **System Integrity Protection (SIP) must be disabled** for `DYLD_INSERT_LIBRARIES` and runtime code patching (used by Dobby) to function. Without disabling SIP, the shim will not work.
