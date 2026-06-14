@@ -31,13 +31,6 @@
 - (CGRect)bounds;
 @end
 
-@interface NSObject (PrivateMetal)
-- (void)compilerPropagatesThreadPriority:(BOOL)propagate;
-- (void)setCompletionQueue:(dispatch_queue_t)queue;
-- (void)setSubmissionQueue:(dispatch_queue_t)queue;
-- (void)setGPUPriority:(int)priority;
-@end
-
 /* ── SkyLight / CoreDisplay SPI marker ────────────────────────────────── */
 
 __attribute__((used, section("__SLSERVER,__slserver")))
@@ -473,40 +466,10 @@ int main(void)
             return 1;
         }
 
-        // Enable thread priority propagation to prevent driver/compiler thread starvation at boot
-        if ([g_mtl_device respondsToSelector:@selector(compilerPropagatesThreadPriority:)]) {
-            printf("[framebufferd] Enabling compiler/driver thread priority propagation on Metal device\n");
-            [g_mtl_device compilerPropagatesThreadPriority:YES];
-        }
-
         g_mtl_queue = [g_mtl_device newCommandQueue];
         if (!g_mtl_queue) {
             LogMetalFailure(@"Metal: failed to create command queue");
             return 1;
-        }
-
-        // Set up custom serial completion/submission queues and GPUPriority to align with WindowServer's setup
-        dispatch_queue_t targetQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
-        dispatch_queue_t completionQueue = dispatch_queue_create_with_target(
-            "com.apple.SkyLight.mtl_completion",
-            DISPATCH_QUEUE_SERIAL,
-            targetQueue);
-        dispatch_queue_t submissionQueue = dispatch_queue_create_with_target(
-            "com.apple.SkyLight.mtl_submit",
-            DISPATCH_QUEUE_SERIAL,
-            targetQueue);
-
-        if ([g_mtl_queue respondsToSelector:@selector(setCompletionQueue:)]) {
-            printf("[framebufferd] Configuring Metal command queue with dedicated completion queue\n");
-            [g_mtl_queue setCompletionQueue:completionQueue];
-        }
-        if ([g_mtl_queue respondsToSelector:@selector(setSubmissionQueue:)]) {
-            printf("[framebufferd] Configuring Metal command queue with dedicated submission queue\n");
-            [g_mtl_queue setSubmissionQueue:submissionQueue];
-        }
-        if ([g_mtl_queue respondsToSelector:@selector(setGPUPriority:)]) {
-            printf("[framebufferd] Setting GPUPriority on Metal command queue to 0\n");
-            [g_mtl_queue setGPUPriority:0];
         }
 
         /* Load the pre-compiled metallib extracted by libwayland-mac */
