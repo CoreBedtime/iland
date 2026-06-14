@@ -98,6 +98,7 @@ static struct {
     int                   pressed_keys;
     int                   pressed_buttons;
     uint32_t              button_state_mask;
+    uint8_t               key_state_map[1024 / 8];
 } g;
 
 static void queue_event(struct libinput_event *ev);
@@ -163,11 +164,25 @@ static void *recv_thread(void *arg)
         case INPUT_IPC_EVENT_DEVICE_REMOVED:
             ev = alloc_event(LIBINPUT_EVENT_DEVICE_REMOVED, dev);
             break;
-        case INPUT_IPC_EVENT_KEYBOARD_KEY:
-            if (msg->key_state == LIBINPUT_KEY_STATE_PRESSED)
-                g.pressed_keys++;
-            else if (g.pressed_keys > 0)
-                g.pressed_keys--;
+        case INPUT_IPC_EVENT_KEYBOARD_KEY: {
+            uint16_t key = msg->key & 0x3FF;
+            int byte = key / 8, bit = key % 8;
+            int already_pressed = (g.key_state_map[byte] >> bit) & 1;
+            int state_changed = 0;
+            if (msg->key_state == LIBINPUT_KEY_STATE_PRESSED) {
+                if (!already_pressed) {
+                    g.pressed_keys++;
+                    g.key_state_map[byte] |= (1 << bit);
+                    state_changed = 1;
+                }
+            } else {
+                if (already_pressed) {
+                    g.pressed_keys--;
+                    g.key_state_map[byte] &= ~(1 << bit);
+                    state_changed = 1;
+                }
+            }
+            if (!state_changed) break;
             ev = alloc_event(LIBINPUT_EVENT_KEYBOARD_KEY, dev);
             if (ev) {
                 ev->keyboard.key = msg->key;
@@ -176,6 +191,7 @@ static void *recv_thread(void *arg)
                 ev->keyboard.time_usec = msg->time_usec;
             }
             break;
+        }
         case INPUT_IPC_EVENT_POINTER_MOTION:
             ev = alloc_event(LIBINPUT_EVENT_POINTER_MOTION, dev);
             if (ev) {

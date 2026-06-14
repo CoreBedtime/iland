@@ -553,12 +553,13 @@ static void iohid_event_callback(void *target, void *sender,
         int32_t usagePage = IOHIDEventGetIntegerValue(event, kIOHIDEventFieldKeyboardUsagePage);
         int32_t usage     = IOHIDEventGetIntegerValue(event, kIOHIDEventFieldKeyboardUsage);
         int32_t down      = IOHIDEventGetIntegerValue(event, kIOHIDEventFieldKeyboardDown);
-        fprintf(stderr, "[inputd]   Keyboard: page=0x%x usage=0x%x down=%d\n",
-                usagePage, usage, down);
-
+        int pressed = (down != 0) ? 1 : 0;
         int evdev = hid_usage_to_evdev((uint32_t)usagePage, (uint32_t)usage);
-        if (evdev > 0)
-            send_key_event(ts, evdev, (int)down);
+        if (evdev > 0) {
+            fprintf(stderr, "[inputd]   Keyboard: page=0x%x usage=0x%x evdev=%d down=%d pressed=%d\n",
+                    usagePage, usage, evdev, (int)down, pressed);
+            send_key_event(ts, evdev, pressed);
+        }
         return;
     }
 
