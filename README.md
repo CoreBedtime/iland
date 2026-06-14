@@ -1,5 +1,5 @@
 <div align="center">
-  <img src=".resources/iland_mascot.png" alt="iland mascot" width="280">
+  <img src=".resources/iland_mascot.png" alt="iland mascot" width="210">
 
   # iland
 
