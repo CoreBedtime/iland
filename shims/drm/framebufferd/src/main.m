@@ -15,7 +15,6 @@
 #include <signal.h>
 
 #import <Foundation/Foundation.h>
-#include <unistd.h>
 #import <QuartzCore/QuartzCore.h>
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
@@ -396,17 +395,6 @@ int main(void)
         if (!g_display_surface) return 1;
 
         /* ── Initialise Metal pipeline ──────────────────────────────── */
-
-
-
-WaitForMetal: {
-        CFMutableDictionaryRef match = IOServiceMatching("AGXAccelerator");
-        io_iterator_t iter = 0;
-        if ((!match) || (IOServiceGetMatchingServices(kIOMainPortDefault, match, &iter) != KERN_SUCCESS)) {
-            usleep(1200);
-            goto WaitForMetal;
-        }
-}
 
         g_mtl_device = MTLCopyAllDevices()[0];
         if (!g_mtl_device) {
