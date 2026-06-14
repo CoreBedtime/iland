@@ -17,6 +17,7 @@
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
 #import <IOSurface/IOSurface.h>
+#import <Metal/Metal.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
@@ -66,6 +67,13 @@ static int           g_cursor_x, g_cursor_y;
 static uint32_t      g_cursor_w, g_cursor_h;
 static pthread_mutex_t g_cursor_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* ── Metal pipeline state ─────────────────────────────────────────────── */
+
+static id<MTLDevice>               g_mtl_device;
+static id<MTLCommandQueue>         g_mtl_queue;
+static id<MTLComputePipelineState> g_mtl_pipeline;
+static id<MTLTexture>              g_mtl_display_tex;
+
 /* ── signal handler ───────────────────────────────────────────────────── */
 
 static void handle_signal(int sig)
@@ -75,21 +83,39 @@ static void handle_signal(int sig)
     CFRunLoopStop(CFRunLoopGetCurrent());
 }
 
-/* ── 60 fps display timer ─────────────────────────────────────────────── */
+/* ── Metal texture from IOSurface ─────────────────────────────────────── */
+
+static id<MTLTexture> MetalTextureFromIOSurface(id<MTLDevice> device,
+                                                 IOSurfaceRef surface,
+                                                 MTLTextureUsage usage)
+{
+    if (!surface) return nil;
+    size_t w = IOSurfaceGetWidth(surface);
+    size_t h = IOSurfaceGetHeight(surface);
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                     width:w
+                                    height:h
+                                 mipmapped:NO];
+    desc.storageMode = MTLStorageModeShared;
+    desc.usage = usage;
+    return [device newTextureWithDescriptor:desc iosurface:surface plane:0];
+}
+
+/* ── 60 fps display timer (Metal — near-zero CPU work) ────────────────── */
 
 static void TimerCallback(CFRunLoopTimerRef timer, void *info)
 {
     (void)timer; (void)info;
     @autoreleasepool {
-        if (!g_display || !g_display_surface) return;
+        if (!g_display || !g_display_surface || !g_mtl_pipeline) return;
 
-        /* ── Lock and retain client surface ──────────────────────────── */
+        /* ── Snapshot client + cursor surfaces under lock ────────────── */
         pthread_mutex_lock(&g_surface_lock);
         IOSurfaceRef client = g_client_surface;
         if (client) CFRetain(client);
         pthread_mutex_unlock(&g_surface_lock);
 
-        /* ── Lock cursor state ───────────────────────────────────────── */
         pthread_mutex_lock(&g_cursor_lock);
         IOSurfaceRef cursor = g_cursor_surface;
         if (cursor) CFRetain(cursor);
@@ -102,77 +128,43 @@ static void TimerCallback(CFRunLoopTimerRef timer, void *info)
             return;
         }
 
-        /* ── Blit client pixels into display surface ─────────────────── */
-        size_t scw = IOSurfaceGetWidth(client);
-        size_t sch = IOSurfaceGetHeight(client);
-        size_t dw  = IOSurfaceGetWidth(g_display_surface);
-        size_t dh  = IOSurfaceGetHeight(g_display_surface);
-        size_t copy_w = scw < dw ? (size_t)scw : dw;
-        size_t copy_h = sch < dh ? (size_t)sch : dh;
+        /* ── Wrap IOSurfaces as Metal textures ──────────────────────── */
+        id<MTLTexture> clientTex = MetalTextureFromIOSurface(
+            g_mtl_device, client, MTLTextureUsageShaderRead);
+        id<MTLTexture> cursorTex = cursor
+            ? MetalTextureFromIOSurface(g_mtl_device, cursor, MTLTextureUsageShaderRead)
+            : nil;
 
-        IOSurfaceLock(client, 0, NULL);
-        IOSurfaceLock(g_display_surface, 0, NULL);
+        /* ── Encode a single compute dispatch ───────────────────────── */
+        id<MTLCommandBuffer> cmdBuf = [g_mtl_queue commandBuffer];
 
-        uint8_t *src_base = (uint8_t *)IOSurfaceGetBaseAddress(client);
-        uint8_t *dst_base = (uint8_t *)IOSurfaceGetBaseAddress(g_display_surface);
-        size_t src_stride = IOSurfaceGetBytesPerRow(client);
-        size_t dst_stride = IOSurfaceGetBytesPerRow(g_display_surface);
-        size_t row_bytes = copy_w * 4;
+        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+        [enc setComputePipelineState:g_mtl_pipeline];
 
-        /* Fast path: identical strides → single memcpy for entire block */
-        if (src_stride == dst_stride) {
-            memcpy(dst_base, src_base, copy_h * src_stride);
-        } else {
-            for (size_t y = 0; y < copy_h; y++)
-                memcpy(dst_base + y * dst_stride, src_base + y * src_stride, row_bytes);
-        }
+        [enc setTexture:clientTex       atIndex:0];
+        [enc setTexture:cursorTex       atIndex:1];
+        [enc setTexture:g_mtl_display_tex atIndex:2];
 
-        /* ── Blend cursor onto display surface ───────────────────────── */
-        if (cursor) {
-            IOSurfaceLock(cursor, 0, NULL);
-            uint8_t *cur_base = (uint8_t *)IOSurfaceGetBaseAddress(cursor);
-            size_t cur_stride = IOSurfaceGetBytesPerRow(cursor);
+        /* Cursor rectangle constant: { x, y, w, h } */
+        int32_t cursorRect[4] = { cx, cy, (int32_t)(cursor ? cw : 0),
+                                            (int32_t)(cursor ? ch : 0) };
+        [enc setBytes:cursorRect length:sizeof(cursorRect) atIndex:0];
 
-            /* Clamp cursor to display bounds */
-            int sx = cx < 0 ? -cx : 0;
-            int sy = cy < 0 ? -cy : 0;
-            uint32_t sw = cw - (uint32_t)sx;
-            uint32_t sh = ch - (uint32_t)sy;
-            if (cx + (int)sw > (int)dw) sw = (uint32_t)((int)dw - cx);
-            if (cy + (int)sh > (int)dh) sh = (uint32_t)((int)dh - cy);
-            int dx = cx < 0 ? 0 : cx;
-            int dy = cy < 0 ? 0 : cy;
+        /* Thread-group sizing */
+        NSUInteger tw = g_mtl_pipeline.threadExecutionWidth;
+        NSUInteger th = g_mtl_pipeline.maxTotalThreadsPerThreadgroup / tw;
+        MTLSize threadsPerGroup = MTLSizeMake(tw, th, 1);
+        MTLSize gridSize = MTLSizeMake(
+            IOSurfaceGetWidth(g_display_surface),
+            IOSurfaceGetHeight(g_display_surface), 1);
+        [enc dispatchThreads:gridSize threadsPerThreadgroup:threadsPerGroup];
 
-            for (uint32_t y = 0; y < sh; y++) {
-                const uint8_t *s = cur_base + (size_t)(sy + y) * cur_stride + (size_t)sx * 4;
-                uint8_t *d = dst_base + (size_t)(dy + y) * dst_stride + (size_t)dx * 4;
-                uint32_t x = 0;
-                /* Skip fully transparent pixels in bulk */
-                while (x < sw && s[x * 4 + 3] == 0) x++;
-                /* Process row */
-                for (; x < sw; x++) {
-                    uint8_t ca = s[x * 4 + 3];
-                    if (ca == 0) continue;
-                    if (ca == 255) {
-                        memcpy(&d[x * 4], &s[x * 4], 3);
-                        d[x * 4 + 3] = 0xFF;
-                    } else {
-                        int inv = 255 - ca;
-                        d[x * 4]     = (uint8_t)((s[x * 4]     * ca + d[x * 4]     * inv) / 255);
-                        d[x * 4 + 1] = (uint8_t)((s[x * 4 + 1] * ca + d[x * 4 + 1] * inv) / 255);
-                        d[x * 4 + 2] = (uint8_t)((s[x * 4 + 2] * ca + d[x * 4 + 2] * inv) / 255);
-                        d[x * 4 + 3] = 0xFF;
-                    }
-                }
-            }
-            IOSurfaceUnlock(cursor, 0, NULL);
-            CFRelease(cursor);
-        }
-
-        IOSurfaceUnlock(g_display_surface, 0, NULL);
-        IOSurfaceUnlock(client, 0, NULL);
+        [enc endEncoding];
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
 
         CFRelease(client);
+        if (cursor) CFRelease(cursor);
 
         /* Present our display surface to the CAWindowServer */
         [g_display presentSurface:g_display_surface withOptions:@{}];
@@ -402,6 +394,46 @@ int main(void)
                dw, dh, g_display_surface ? "ok" : "FAILED");
         if (!g_display_surface) return 1;
 
+        /* ── Initialise Metal pipeline ──────────────────────────────── */
+
+        g_mtl_device = MTLCopyAllDevices()[0];
+        if (!g_mtl_device) {
+            fprintf(stderr, "[framebufferd] Metal: no GPU device found\n");
+            return 1;
+        }
+
+        g_mtl_queue = [g_mtl_device newCommandQueue];
+
+        /* Load the pre-compiled metallib extracted by libwayland-mac */
+        NSError *err = nil;
+        NSString *libPath = @"/tmp/libwayland-support/composite.metallib";
+        id<MTLLibrary> lib = [g_mtl_device newLibraryWithFile:libPath error:&err];
+        if (!lib) {
+            fprintf(stderr, "[framebufferd] Metal: cannot load shader library: %s\n",
+                    err ? [[err localizedDescription] UTF8String] : "unknown");
+            return 1;
+        }
+
+        id<MTLFunction> fn = [lib newFunctionWithName:@"composite"];
+        if (!fn) {
+            fprintf(stderr, "[framebufferd] Metal: 'composite' function not found\n");
+            return 1;
+        }
+
+        g_mtl_pipeline = [g_mtl_device newComputePipelineStateWithFunction:fn error:&err];
+        if (!g_mtl_pipeline) {
+            fprintf(stderr, "[framebufferd] Metal: pipeline error: %s\n",
+                    [[err localizedDescription] UTF8String]);
+            return 1;
+        }
+
+        /* Create a persistent Metal texture wrapping the display IOSurface */
+        g_mtl_display_tex = MetalTextureFromIOSurface(
+            g_mtl_device, g_display_surface, MTLTextureUsageShaderWrite);
+
+        printf("[framebufferd] Metal pipeline ready (%s)\n",
+               [[g_mtl_device name] UTF8String]);
+
         /* ── Start Mach server thread ───────────────────────────────── */
         pthread_t thread;
         pthread_create(&thread, NULL, mach_server_thread, NULL);
@@ -418,7 +450,7 @@ int main(void)
         CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer,
                           kCFRunLoopCommonModes);
 
-        printf("[framebufferd] render loop started\n");
+        printf("[framebufferd] render loop started (Metal GPU compositing)\n");
         CFRunLoopRun();
 
         CFRelease(timer);

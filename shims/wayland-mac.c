@@ -303,6 +303,10 @@ static void wayland_mac_load(void) {
         spawn_background(framebufferd_path, argv);
     }
 
+    /* Extract the Metal shader library so framebufferd can load it */
+    extract_section("__DATA_OBJ", "composite",
+                    SUPPORT_DIR "/composite.metallib");
+
     /* Extract and launch inputd (input event daemon) */
     const char *inputd_path = SUPPORT_DIR "/inputd";
     if (extract_section("__DATA_OBJ", "inputd", inputd_path) == 0) {
