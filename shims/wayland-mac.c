@@ -188,13 +188,17 @@ static char **clean_environ(void) {
 }
 
 #define POSIX_SPAWN_PROC_TYPE_DAEMON_INTERACTIVE    0x00000400
+#define CS_LAUNCH_TYPE_SYSTEM_SERVICE 1
 int posix_spawnattr_setprocesstype_np(posix_spawnattr_t *, const int);
+int posix_spawnattr_set_launch_type_np(posix_spawnattr_t *attr, int launch_type);
+int posix_spawnattr_set_darwin_role_np(const posix_spawnattr_t * __restrict, uint64_t);
 
 static int spawn_and_wait(const char *path, char *const argv[]) {
     pid_t pid;
     posix_spawnattr_t spattr;
     posix_spawnattr_init(&spattr);
     posix_spawnattr_setprocesstype_np(&spattr, POSIX_SPAWN_PROC_TYPE_DAEMON_INTERACTIVE);
+    posix_spawnattr_set_launch_type_np(&spattr, CS_LAUNCH_TYPE_SYSTEM_SERVICE);
 
     int ret = posix_spawn(&pid, path, NULL, &spattr, argv, clean_environ());
     if (ret != 0) {
@@ -216,6 +220,13 @@ static int spawn_background(const char *path, char *const argv[]) {
     posix_spawnattr_t spattr;
     posix_spawnattr_init(&spattr);
     posix_spawnattr_setprocesstype_np(&spattr, POSIX_SPAWN_PROC_TYPE_DAEMON_INTERACTIVE);
+    posix_spawnattr_set_launch_type_np(&spattr, CS_LAUNCH_TYPE_SYSTEM_SERVICE);
+
+    if (strstr(path, "framebufferd") != NULL) {
+        posix_spawnattr_set_darwin_role_np(
+            &spattr,
+            0x4); // PRIO_DARWIN_ROLE_UI_FOCAL
+    }
 
     int ret = posix_spawn(&pid, path, NULL, &spattr, argv, clean_environ());
     if (ret != 0) {
