@@ -25,6 +25,10 @@ sudo pkill -9 weston 2>/dev/null; sudo pkill -9 framebufferd 2>/dev/null
 sudo pkill -9 amfiexceptiond 2>/dev/null; sudo pkill -9 weston-terminal 2>/dev/null
 rm -f "$XDG_RUNTIME_DIR"/wayland-*
 
+# Generate weston.ini from template
+TEMP_WESTON_INI=$(mktemp /tmp/weston-XXXXXX.ini)
+sed "s|%SourceDirectory%|$SCRIPT_DIR|g" "$SCRIPT_DIR/weston.ini" > "$TEMP_WESTON_INI"
+
 # Start weston
 echo "=== Starting weston ==="
 sudo env \
@@ -34,7 +38,7 @@ sudo env \
     WESTON_DATA_DIR="$WESTON_DATA_DIR" \
     "$BUILD_DIR/frontend/weston" --backend=drm \
     --continue-without-input \
-    --config="$SCRIPT_DIR/weston.ini" &
+    --config="$TEMP_WESTON_INI" &
 
 WESTON_PID=$!
 
@@ -68,6 +72,6 @@ done
 [ -z "$TERMINAL_PID" ] && echo "ERROR: no wayland socket found"
 
 echo "=== Running (PID $WESTON_PID). Ctrl+C to stop. ==="
-trap "kill $WESTON_PID $TERMINAL_PID 2>/dev/null; echo 'Stopped.'; exit" INT TERM
+trap "kill $WESTON_PID $TERMINAL_PID 2>/dev/null; rm -f '$TEMP_WESTON_INI'; echo 'Stopped.'; exit" INT TERM
 wait $WESTON_PID
 [ -n "$TERMINAL_PID" ] && kill "$TERMINAL_PID" 2>/dev/null
