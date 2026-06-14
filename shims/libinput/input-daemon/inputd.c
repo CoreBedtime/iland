@@ -199,10 +199,6 @@ static void handle_signal(int sig)
 
 static IOHIDEventSystemRef g_hid_system;
 
-/* button tracking — detect release when no Button child present */
-static bool g_hid_btn_pressed;
-static int  g_hid_btn_number;
-
 /* multitouch state */
 static MTDeviceRef g_mt_device;
 static int g_mt_finger_id = -1;
@@ -578,13 +574,10 @@ static void iohid_event_callback(void *target, void *sender,
         int btn = BTN_LEFT + (number - 1);
         int pressed = (mask != 0) ? 1 : 0;
         send_button_event(ts, btn, pressed);
-        g_hid_btn_pressed = pressed;
-        g_hid_btn_number = number;
         return;
     }
 
     /* Process children — Digitizer events contain Button children for click */
-    bool found_button_child = false;
     CFArrayRef children = IOHIDEventGetChildren(event);
     if (children) {
         CFIndex count = CFArrayGetCount(children);
@@ -601,9 +594,6 @@ static void iohid_event_callback(void *target, void *sender,
                 int btn = BTN_LEFT + (number - 1);
                 int pressed = (mask != 0) ? 1 : 0;
                 send_button_event(ts, btn, pressed);
-                g_hid_btn_pressed = pressed;
-                g_hid_btn_number = number;
-                found_button_child = true;
             } else if (ctype == kIOHIDEventTypeTranslation) {
                 float dx = IOHIDEventGetFloatValue(child, kIOHIDEventFieldTranslationX);
                 float dy = IOHIDEventGetFloatValue(child, kIOHIDEventFieldTranslationY);
@@ -618,18 +608,6 @@ static void iohid_event_callback(void *target, void *sender,
                 if (sx != 0.0f) send_scroll_event(ts, 1, (double)sx);
             }
         }
-    }
-
-    /* If we had a pressed button but no Button child in this event,
-     * the button was released — synthesize the release */
-    if (g_hid_btn_pressed && !found_button_child &&
-        (type == kIOHIDEventTypeDigitizer || type == kIOHIDEventTypeTranslation ||
-         type == kIOHIDEventTypeScroll || type == kIOHIDEventTypeMouse)) {
-        int btn = BTN_LEFT + (g_hid_btn_number - 1);
-        fprintf(stderr, "[inputd]   Auto-releasing button %d (no Button child)\n",
-                g_hid_btn_number);
-        send_button_event(ts, btn, 0);
-        g_hid_btn_pressed = false;
     }
 
     /* Also handle top-level types that aren't keyboard/button */

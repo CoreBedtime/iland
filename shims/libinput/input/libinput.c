@@ -189,17 +189,21 @@ static void *recv_thread(void *arg)
         case INPUT_IPC_EVENT_POINTER_BUTTON: {
             uint32_t btn_bit = 1u << (msg->pointer_button & 31);
             int already_pressed = (g.button_state_mask & btn_bit) != 0;
+            int state_changed = 0;
             if (msg->pointer_button_state == LIBINPUT_BUTTON_STATE_PRESSED) {
                 if (!already_pressed) {
                     g.pressed_buttons++;
                     g.button_state_mask |= btn_bit;
+                    state_changed = 1;
                 }
             } else {
                 if (already_pressed) {
                     g.pressed_buttons--;
                     g.button_state_mask &= ~btn_bit;
+                    state_changed = 1;
                 }
             }
+            if (!state_changed) break;
             ev = alloc_event(LIBINPUT_EVENT_POINTER_BUTTON, dev);
             if (ev) {
                 ev->pointer.button = msg->pointer_button;
