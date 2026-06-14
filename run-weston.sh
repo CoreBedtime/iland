@@ -26,7 +26,7 @@ sudo pkill -9 amfiexceptiond 2>/dev/null
 sudo rm -f "$XDG_RUNTIME_DIR"/wayland-*
 
 # Generate weston.ini from template
-rm -f /tmp/weston-*.ini
+sudo rm -f /tmp/weston-*.ini
 TEMP_WESTON_INI=$(mktemp /tmp/weston-XXXXXX.ini)
 sed "s|%SourceDirectory%|$SCRIPT_DIR|g" "$SCRIPT_DIR/weston.ini" > "$TEMP_WESTON_INI"
 
