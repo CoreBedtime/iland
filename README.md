@@ -37,7 +37,9 @@ Produces `libwayland-mac.dylib`.
 
 # Weston?
 Clean: `sudo pkill -9 inputd framebufferd weston caffeinate; sudo rm -rf /private/tmp/libwayland-support; rm -rf build build-weston;`
+
 Build: `sh compile.sh; sh build-weston.sh`
+
 All: `sudo pkill -9 inputd framebufferd weston caffeinate; sudo rm -rf /private/tmp/libwayland-support; rm -rf build build-weston; sh compile.sh; sh build-weston.sh`
 
 **System Integrity Protection (SIP) must be disabled** for `DYLD_INSERT_LIBRARIES` and runtime code patching (used by Dobby) to function. Without disabling SIP, the shim will not work.
