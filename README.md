@@ -16,7 +16,7 @@ No AppKit, Cocoa, Aqua, or WindowServer integration is required.
 
 # Bullshit!
 
-I'm not kidding! Look for yourself!
+I'm not kidding! Look for yourself! (Booting directly to Weston)
 
 <img src=".resources/booting-to-weston.gif" alt="Booting to Weston on macOS" width="600">
 
