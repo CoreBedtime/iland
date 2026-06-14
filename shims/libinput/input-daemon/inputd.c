@@ -9,10 +9,146 @@
 #include <mach/mach_time.h>
 #include <input_ipc.h>
 
-#include <hidapi/hidapi.h>
 #include <CoreFoundation/CoreFoundation.h>
-#include <IOKit/hid/IOHIDManager.h>
-#include <IOKit/hid/IOHIDKeys.h>
+
+/* ---- private IOKit IOHIDEventSystem API (from IOKit.framework) ---- */
+typedef struct __IOHIDEventSystem *IOHIDEventSystemRef;
+typedef struct __IOHIDEvent      *IOHIDEventRef;
+
+extern IOHIDEventSystemRef IOHIDEventSystemCreate(CFAllocatorRef);
+extern int                 IOHIDEventSystemOpen(IOHIDEventSystemRef, void *callback,
+                                                 void *target, void *notification,
+                                                 void *runLoop);
+
+extern uint32_t IOHIDEventGetType(IOHIDEventRef);
+extern uint64_t IOHIDEventGetTimeStamp(IOHIDEventRef);
+extern int32_t  IOHIDEventGetIntegerValue(IOHIDEventRef, uint32_t field);
+extern float    IOHIDEventGetFloatValue(IOHIDEventRef, uint32_t field);
+extern CFArrayRef IOHIDEventGetChildren(IOHIDEventRef);
+extern IOHIDEventRef IOHIDEventCreateCopy(CFAllocatorRef, IOHIDEventRef);
+extern CFStringRef   IOHIDEventCopyDescription(IOHIDEventRef, void *);
+extern int           IOHIDEventSystemClose(IOHIDEventSystemRef, void *);
+extern int           IOHIDEventConformsTo(IOHIDEventRef, uint32_t type);
+
+/* IOHIDEventType enum (from IOKit/hid/IOHIDEventTypes.h) */
+enum {
+    kIOHIDEventTypeNULL             = 0,
+    kIOHIDEventTypeVendorDefined    = 1,
+    kIOHIDEventTypeButton           = 2,
+    kIOHIDEventTypeKeyboard         = 3,
+    kIOHIDEventTypeTranslation      = 4,
+    kIOHIDEventTypeRotation         = 5,
+    kIOHIDEventTypeScroll           = 6,
+    kIOHIDEventTypeScale            = 7,
+    kIOHIDEventTypeZoom             = 8,
+    kIOHIDEventTypeVelocity         = 9,
+    kIOHIDEventTypeOrientation      = 10,
+    kIOHIDEventTypeDigitizer        = 11,
+    kIOHIDEventTypeAmbientLightSensor = 12,
+    kIOHIDEventTypeAccelerometer    = 13,
+    kIOHIDEventTypeProximity        = 14,
+    kIOHIDEventTypeTemperature      = 15,
+    kIOHIDEventTypeNavigationSwipe  = 16,
+    kIOHIDEventTypeMouse            = 17,
+    kIOHIDEventTypeProgress         = 18,
+    kIOHIDEventTypeGyro             = 20,
+    kIOHIDEventTypeCompass          = 21,
+    kIOHIDEventTypeZoomToggle       = 22,
+    kIOHIDEventTypeDockSwipe        = 23,
+    kIOHIDEventTypeSymbolicHotKey   = 24,
+    kIOHIDEventTypePower            = 25,
+    kIOHIDEventTypeFluidTouchGesture = 26,
+    kIOHIDEventTypeBoundaryScroll   = 27,
+    kIOHIDEventTypeGenericGesture   = 28,
+    kIOHIDEventTypeForce            = 29,
+};
+
+/* IOHIDEventField paths: (type << 16) | field_offset */
+#define IOHIDEventFieldBase(type) ((uint32_t)(type) << 16)
+
+enum {
+    /* Keyboard (type 3) */
+    kIOHIDEventFieldKeyboardUsagePage = IOHIDEventFieldBase(3) | 0,
+    kIOHIDEventFieldKeyboardUsage     = IOHIDEventFieldBase(3) | 1,
+    kIOHIDEventFieldKeyboardDown      = IOHIDEventFieldBase(3) | 2,
+    kIOHIDEventFieldKeyboardRepeat    = IOHIDEventFieldBase(3) | 3,
+
+    /* Button (type 2) */
+    kIOHIDEventFieldButtonMask       = IOHIDEventFieldBase(2) | 0,
+    kIOHIDEventFieldButtonNumber     = IOHIDEventFieldBase(2) | 1,
+    kIOHIDEventFieldButtonClickCount = IOHIDEventFieldBase(2) | 2,
+    kIOHIDEventFieldButtonPressure   = IOHIDEventFieldBase(2) | 3,
+    kIOHIDEventFieldButtonState      = IOHIDEventFieldBase(2) | 4,
+
+    /* Translation (type 4) — trackpad delta */
+    kIOHIDEventFieldTranslationX = IOHIDEventFieldBase(4) | 0,
+    kIOHIDEventFieldTranslationY = IOHIDEventFieldBase(4) | 1,
+    kIOHIDEventFieldTranslationZ = IOHIDEventFieldBase(4) | 2,
+
+    /* Scroll (type 6) */
+    kIOHIDEventFieldScrollX       = IOHIDEventFieldBase(6) | 0,
+    kIOHIDEventFieldScrollY       = IOHIDEventFieldBase(6) | 1,
+    kIOHIDEventFieldScrollZ       = IOHIDEventFieldBase(6) | 2,
+    kIOHIDEventFieldScrollMomentum = IOHIDEventFieldBase(6) | 3,
+
+    /* Mouse (type 17) — field offsets per IDA: 0x110000=X, 0x110001=Y */
+    kIOHIDEventFieldMouseX        = IOHIDEventFieldBase(17) | 0,
+    kIOHIDEventFieldMouseY        = IOHIDEventFieldBase(17) | 1,
+    kIOHIDEventFieldMouseButton   = IOHIDEventFieldBase(17) | 3,
+
+    /* Digitizer (type 11) — absolute touch */
+    kIOHIDEventFieldDigitizerX             = IOHIDEventFieldBase(11) | 0,
+    kIOHIDEventFieldDigitizerY             = IOHIDEventFieldBase(11) | 1,
+    kIOHIDEventFieldDigitizerType          = IOHIDEventFieldBase(11) | 2,
+    kIOHIDEventFieldDigitizerIndex         = IOHIDEventFieldBase(11) | 3,
+    kIOHIDEventFieldDigitizerIdentity      = IOHIDEventFieldBase(11) | 4,
+    kIOHIDEventFieldDigitizerEventMask     = IOHIDEventFieldBase(11) | 5,
+    kIOHIDEventFieldDigitizerRange         = IOHIDEventFieldBase(11) | 14,
+    kIOHIDEventFieldDigitizerTouch         = IOHIDEventFieldBase(11) | 15,
+    kIOHIDEventFieldDigitizerCollection    = IOHIDEventFieldBase(11) | 16,
+    kIOHIDEventFieldDigitizerChildCount    = IOHIDEventFieldBase(11) | 17,
+
+    /* Accelerometer (type 13) */
+    kIOHIDEventFieldAccelerometerX = IOHIDEventFieldBase(13) | 0,
+    kIOHIDEventFieldAccelerometerY = IOHIDEventFieldBase(13) | 1,
+    kIOHIDEventFieldAccelerometerZ = IOHIDEventFieldBase(13) | 2,
+};
+
+static const char *iohid_event_type_name(uint32_t type)
+{
+    switch (type) {
+    case kIOHIDEventTypeNULL:              return "NULL";
+    case kIOHIDEventTypeVendorDefined:     return "VendorDefined";
+    case kIOHIDEventTypeButton:            return "Button";
+    case kIOHIDEventTypeKeyboard:          return "Keyboard";
+    case kIOHIDEventTypeTranslation:       return "Translation";
+    case kIOHIDEventTypeRotation:          return "Rotation";
+    case kIOHIDEventTypeScroll:            return "Scroll";
+    case kIOHIDEventTypeScale:             return "Scale";
+    case kIOHIDEventTypeZoom:              return "Zoom";
+    case kIOHIDEventTypeVelocity:          return "Velocity";
+    case kIOHIDEventTypeOrientation:       return "Orientation";
+    case kIOHIDEventTypeDigitizer:         return "Digitizer";
+    case kIOHIDEventTypeAmbientLightSensor: return "AmbientLightSensor";
+    case kIOHIDEventTypeAccelerometer:     return "Accelerometer";
+    case kIOHIDEventTypeProximity:         return "Proximity";
+    case kIOHIDEventTypeTemperature:       return "Temperature";
+    case kIOHIDEventTypeNavigationSwipe:   return "NavigationSwipe";
+    case kIOHIDEventTypeMouse:             return "Mouse";
+    case kIOHIDEventTypeProgress:          return "Progress";
+    case kIOHIDEventTypeGyro:              return "Gyro";
+    case kIOHIDEventTypeCompass:           return "Compass";
+    case kIOHIDEventTypeZoomToggle:        return "ZoomToggle";
+    case kIOHIDEventTypeDockSwipe:         return "DockSwipe";
+    case kIOHIDEventTypeSymbolicHotKey:    return "SymbolicHotKey";
+    case kIOHIDEventTypePower:             return "Power";
+    case kIOHIDEventTypeFluidTouchGesture: return "FluidTouchGesture";
+    case kIOHIDEventTypeBoundaryScroll:    return "BoundaryScroll";
+    case kIOHIDEventTypeGenericGesture:    return "GenericGesture";
+    case kIOHIDEventTypeForce:             return "Force";
+    }
+    return "Unknown";
+}
 
 /* MultitouchSupport private framework types */
 typedef struct { float x, y; } MTPoint;
@@ -61,7 +197,11 @@ static void handle_signal(int sig)
     g_running = false;
 }
 
-static IOHIDManagerRef g_hid_manager;
+static IOHIDEventSystemRef g_hid_system;
+
+/* button tracking — detect release when no Button child present */
+static bool g_hid_btn_pressed;
+static int  g_hid_btn_number;
 
 /* multitouch state */
 static MTDeviceRef g_mt_device;
@@ -382,80 +522,6 @@ static void mt_contact_frame(MTDeviceRef device, MTTouch touches[],
     g_mt_touching = false;
 }
 
-static void hid_value_cb(void *context, IOReturn result, void *sender,
-                          IOHIDValueRef value)
-{
-    (void)context;(void)result;(void)sender;
-
-    IOHIDElementRef elem = IOHIDValueGetElement(value);
-    if (!elem) return;
-
-    uint32_t page  = IOHIDElementGetUsagePage(elem);
-    uint32_t usage = IOHIDElementGetUsage(elem);
-    CFIndex  val   = IOHIDValueGetIntegerValue(value);
-    uint64_t ts    = now_usec();
-
-    if (page == kHIDPage_KeyboardOrKeypad) {
-        int evdev = hid_usage_to_evdev(page, (uint32_t)usage);
-        if (evdev > 0)
-            send_key_event(ts, evdev, (int)val);
-    } else if (page == kHIDPage_Button) {
-        int btn = BTN_LEFT + (int)(usage - 1);
-        send_button_event(ts, btn, (int)val);
-    } else if (page == kHIDPage_GenericDesktop) {
-        switch (usage) {
-        case kHIDUsage_GD_X:
-            accum_motion((double)val, 0.0);
-            break;
-        case kHIDUsage_GD_Y:
-            accum_motion(0.0, (double)val);
-            break;
-        case kHIDUsage_GD_Wheel:
-            send_scroll_event(ts, 0, (double)val);
-            break;
-        }
-    } else if (page == kHIDPage_Consumer) {
-        int evdev = 0;
-        switch (usage) {
-        case 0x006F: evdev = KEY_BRIGHTNESSUP;   break;
-        case 0x0070: evdev = KEY_BRIGHTNESSDOWN; break;
-        case 0x00E2: evdev = KEY_MUTE;           break;
-        case 0x00E9: evdev = KEY_VOLUMEUP;       break;
-        case 0x00EA: evdev = KEY_VOLUMEDOWN;     break;
-        case 0x00B5: evdev = KEY_CALC;           break;
-        case 0x0183: evdev = KEY_SLEEP;          break;
-        case 0x0192: evdev = KEY_MENU;           break;
-        case 0x0221: evdev = KEY_SEARCH;         break;
-        case 0x0223: evdev = KEY_HOME;           break;
-        case 0x0224: evdev = KEY_BACK;           break;
-        case 0x0225: evdev = KEY_FORWARD;        break;
-        case 0x0226: evdev = KEY_STOP;           break;
-        case 0x0227: evdev = KEY_REFRESH;        break;
-        case 0x022A: evdev = KEY_BOOKMARKS;      break;
-        }
-        if (evdev > 0)
-            send_key_event(ts, evdev, (int)val);
-    }
-}
-
-static void hid_device_matched_cb(void *context, IOReturn result,
-                                   void *sender, IOHIDDeviceRef device)
-{
-    (void)context;(void)result;(void)sender;
-    CFStringRef name = IOHIDDeviceGetProperty(device,
-                                                CFSTR(kIOHIDProductKey));
-    char buf[128] = "Unknown";
-    if (name && CFStringGetCString(name, buf, sizeof(buf),
-                                    kCFStringEncodingUTF8))
-        fprintf(stderr, "[inputd] matched HID device: %s\n", buf);
-}
-
-static void hid_device_removed_cb(void *context, IOReturn result,
-                                   void *sender, IOHIDDeviceRef device)
-{
-    (void)context;(void)result;(void)sender;(void)device;
-}
-
 static void motion_timer_cb(CFRunLoopTimerRef timer, void *info)
 {
     (void)timer;(void)info;
@@ -466,65 +532,165 @@ static void motion_timer_cb(CFRunLoopTimerRef timer, void *info)
     flush_motion();
 }
 
+/* IOHIDEvent callback — matches CGXHIDEventCallback signature from WSInitialize.
+ * IOHIDEventSystemOpen(system, iohid_event_callback, NULL, NULL, NULL) */
+static void iohid_event_callback(void *target, void *sender,
+                                  void *notification, IOHIDEventRef event)
+{
+    (void)target; (void)sender; (void)notification;
+
+    if (!event) return;
+
+    uint32_t type = IOHIDEventGetType(event);
+    uint64_t ts   = IOHIDEventGetTimeStamp(event);
+
+    /* Use IOHIDEventConformsTo like EventTranslator does — events may be
+     * VendorDefined (type 1) but still conform to keyboard (3) or button (2). */
+    int conforms_kb  = IOHIDEventConformsTo(event, kIOHIDEventTypeKeyboard);
+    int conforms_btn = IOHIDEventConformsTo(event, kIOHIDEventTypeButton);
+
+    fprintf(stderr, "[inputd] IOHIDEvent type=%u (%s) conforms_kb=%d conforms_btn=%d ts=%llu\n",
+            type, iohid_event_type_name(type), conforms_kb, conforms_btn, ts);
+
+    /* Keyboard — check conforms first (covers VendorDefined wrapping keyboard) */
+    if (conforms_kb) {
+        int32_t usagePage = IOHIDEventGetIntegerValue(event, kIOHIDEventFieldKeyboardUsagePage);
+        int32_t usage     = IOHIDEventGetIntegerValue(event, kIOHIDEventFieldKeyboardUsage);
+        int32_t down      = IOHIDEventGetIntegerValue(event, kIOHIDEventFieldKeyboardDown);
+        fprintf(stderr, "[inputd]   Keyboard: page=0x%x usage=0x%x down=%d\n",
+                usagePage, usage, down);
+
+        int evdev = hid_usage_to_evdev((uint32_t)usagePage, (uint32_t)usage);
+        if (evdev > 0)
+            send_key_event(ts, evdev, (int)down);
+        return;
+    }
+
+    /* Button — check conforms first */
+    if (conforms_btn) {
+        int32_t mask   = IOHIDEventGetIntegerValue(event, kIOHIDEventFieldButtonMask);
+        int32_t number = IOHIDEventGetIntegerValue(event, kIOHIDEventFieldButtonNumber);
+        int32_t clicks = IOHIDEventGetIntegerValue(event, kIOHIDEventFieldButtonClickCount);
+        int32_t state  = IOHIDEventGetIntegerValue(event, kIOHIDEventFieldButtonState);
+        fprintf(stderr, "[inputd]   Button: mask=0x%x number=%d clicks=%d state=%d\n",
+                mask, number, clicks, state);
+
+        int btn = BTN_LEFT + (number - 1);
+        int pressed = (mask != 0) ? 1 : 0;
+        send_button_event(ts, btn, pressed);
+        g_hid_btn_pressed = pressed;
+        g_hid_btn_number = number;
+        return;
+    }
+
+    /* Process children — Digitizer events contain Button children for click */
+    bool found_button_child = false;
+    CFArrayRef children = IOHIDEventGetChildren(event);
+    if (children) {
+        CFIndex count = CFArrayGetCount(children);
+        for (CFIndex i = 0; i < count; i++) {
+            IOHIDEventRef child = (IOHIDEventRef)CFArrayGetValueAtIndex(children, i);
+            uint32_t ctype = IOHIDEventGetType(child);
+
+            if (IOHIDEventConformsTo(child, kIOHIDEventTypeButton)) {
+                int32_t number = IOHIDEventGetIntegerValue(child, kIOHIDEventFieldButtonNumber);
+                int32_t mask   = IOHIDEventGetIntegerValue(child, kIOHIDEventFieldButtonMask);
+                int32_t clicks = IOHIDEventGetIntegerValue(child, kIOHIDEventFieldButtonClickCount);
+                int32_t state  = IOHIDEventGetIntegerValue(child, kIOHIDEventFieldButtonState);
+                fprintf(stderr, "[inputd]   Child Button: number=%d mask=0x%x clicks=%d state=%d\n", number, mask, clicks, state);
+                int btn = BTN_LEFT + (number - 1);
+                int pressed = (mask != 0) ? 1 : 0;
+                send_button_event(ts, btn, pressed);
+                g_hid_btn_pressed = pressed;
+                g_hid_btn_number = number;
+                found_button_child = true;
+            } else if (ctype == kIOHIDEventTypeTranslation) {
+                float dx = IOHIDEventGetFloatValue(child, kIOHIDEventFieldTranslationX);
+                float dy = IOHIDEventGetFloatValue(child, kIOHIDEventFieldTranslationY);
+                fprintf(stderr, "[inputd]   Child Translation: dx=%.2f dy=%.2f\n", dx, dy);
+                if (dx != 0.0f || dy != 0.0f)
+                    accum_motion((double)dx, (double)dy);
+            } else if (ctype == kIOHIDEventTypeScroll) {
+                float sy = IOHIDEventGetFloatValue(child, kIOHIDEventFieldScrollY);
+                float sx = IOHIDEventGetFloatValue(child, kIOHIDEventFieldScrollX);
+                fprintf(stderr, "[inputd]   Child Scroll: sx=%.2f sy=%.2f\n", sx, sy);
+                if (sy != 0.0f) send_scroll_event(ts, 0, (double)sy);
+                if (sx != 0.0f) send_scroll_event(ts, 1, (double)sx);
+            }
+        }
+    }
+
+    /* If we had a pressed button but no Button child in this event,
+     * the button was released — synthesize the release */
+    if (g_hid_btn_pressed && !found_button_child &&
+        (type == kIOHIDEventTypeDigitizer || type == kIOHIDEventTypeTranslation ||
+         type == kIOHIDEventTypeScroll || type == kIOHIDEventTypeMouse)) {
+        int btn = BTN_LEFT + (g_hid_btn_number - 1);
+        fprintf(stderr, "[inputd]   Auto-releasing button %d (no Button child)\n",
+                g_hid_btn_number);
+        send_button_event(ts, btn, 0);
+        g_hid_btn_pressed = false;
+    }
+
+    /* Also handle top-level types that aren't keyboard/button */
+    switch (type) {
+    case kIOHIDEventTypeTranslation: {
+        float dx = IOHIDEventGetFloatValue(event, kIOHIDEventFieldTranslationX);
+        float dy = IOHIDEventGetFloatValue(event, kIOHIDEventFieldTranslationY);
+        fprintf(stderr, "[inputd]   Translation: dx=%.2f dy=%.2f\n", dx, dy);
+        if (dx != 0.0f || dy != 0.0f)
+            accum_motion((double)dx, (double)dy);
+        break;
+    }
+    case kIOHIDEventTypeScroll: {
+        float sx = IOHIDEventGetFloatValue(event, kIOHIDEventFieldScrollX);
+        float sy = IOHIDEventGetFloatValue(event, kIOHIDEventFieldScrollY);
+        fprintf(stderr, "[inputd]   Scroll: sx=%.2f sy=%.2f\n", sx, sy);
+        if (sy != 0.0f) send_scroll_event(ts, 0, (double)sy);
+        if (sx != 0.0f) send_scroll_event(ts, 1, (double)sx);
+        break;
+    }
+    case kIOHIDEventTypeMouse: {
+        float mx = IOHIDEventGetFloatValue(event, kIOHIDEventFieldMouseX);
+        float my = IOHIDEventGetFloatValue(event, kIOHIDEventFieldMouseY);
+        fprintf(stderr, "[inputd]   Mouse: x=%.2f y=%.2f\n", mx, my);
+        if (mx != 0.0f || my != 0.0f)
+            accum_motion((double)mx, (double)my);
+        break;
+    }
+    case kIOHIDEventTypeDigitizer: {
+        float tx = IOHIDEventGetFloatValue(event, kIOHIDEventFieldDigitizerX);
+        float ty = IOHIDEventGetFloatValue(event, kIOHIDEventFieldDigitizerY);
+        int32_t touch = IOHIDEventGetIntegerValue(event, kIOHIDEventFieldDigitizerTouch);
+        fprintf(stderr, "[inputd]   Digitizer: x=%.4f y=%.4f touch=%d\n",
+                tx, ty, touch);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 static void *hid_thread(void *arg)
 {
     (void)arg;
 
-    g_hid_manager = IOHIDManagerCreate(kCFAllocatorDefault,
-                                        kIOHIDManagerOptionNone);
-    if (!g_hid_manager) {
-        fprintf(stderr, "[inputd] IOHIDManagerCreate failed\n");
+    g_hid_system = IOHIDEventSystemCreate(kCFAllocatorDefault);
+    if (!g_hid_system) {
+        fprintf(stderr, "[inputd] IOHIDEventSystemCreate failed\n");
         return NULL;
     }
 
-    CFNumberRef page_num;
-    CFStringRef page_key = CFSTR(kIOHIDDeviceUsagePageKey);
-    void *keys[1] = { (void *)page_key };
-    void *vals[1];
-
-    page_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type,
-                               &(int32_t){ kHIDPage_KeyboardOrKeypad });
-    vals[0] = (void *)page_num;
-    CFDictionaryRef keyboard_match = CFDictionaryCreate(
-        kCFAllocatorDefault, (const void **)keys, (const void **)vals,
-        1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    CFRelease(page_num);
-
-    page_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type,
-                               &(int32_t){ kHIDPage_GenericDesktop });
-    vals[0] = (void *)page_num;
-    CFDictionaryRef pointer_match = CFDictionaryCreate(
-        kCFAllocatorDefault, (const void **)keys, (const void **)vals,
-        1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    CFRelease(page_num);
-
-    CFTypeRef match_arr[2] = { keyboard_match, pointer_match };
-    CFArrayRef matches = CFArrayCreate(
-        kCFAllocatorDefault, (const void **)match_arr, 2,
-        &kCFTypeArrayCallBacks);
-    CFRelease(keyboard_match);
-    CFRelease(pointer_match);
-
-    IOHIDManagerSetDeviceMatchingMultiple(g_hid_manager, matches);
-
-    IOHIDManagerRegisterDeviceMatchingCallback(g_hid_manager,
-                                                hid_device_matched_cb, NULL);
-    IOHIDManagerRegisterDeviceRemovalCallback(g_hid_manager,
-                                               hid_device_removed_cb, NULL);
-    IOHIDManagerRegisterInputValueCallback(g_hid_manager, hid_value_cb,
-                                            NULL);
-
-    IOHIDManagerScheduleWithRunLoop(g_hid_manager, CFRunLoopGetCurrent(),
-                                     kCFRunLoopDefaultMode);
-
-    IOReturn ret = IOHIDManagerOpen(g_hid_manager, kIOHIDManagerOptionNone);
-    if (ret != kIOReturnSuccess) {
-        fprintf(stderr, "[inputd] IOHIDManagerOpen: 0x%x\n", ret);
-        CFRelease(g_hid_manager);
+    int ret = IOHIDEventSystemOpen(g_hid_system, iohid_event_callback,
+                                    NULL, NULL, NULL);
+    if (!ret) {
+        fprintf(stderr, "[inputd] IOHIDEventSystemOpen failed\n");
+        CFRelease(g_hid_system);
+        g_hid_system = NULL;
         return NULL;
     }
 
-    fprintf(stderr, "[inputd] HID capture started\n");
+    fprintf(stderr, "[inputd] IOHIDEventSystem capture started\n");
 
     if (MTDeviceIsAvailable()) {
         g_mt_device = MTDeviceCreateDefault();
@@ -552,27 +718,10 @@ static void *hid_thread(void *arg)
         MTDeviceRelease(g_mt_device);
         g_mt_device = NULL;
     }
-    IOHIDManagerClose(g_hid_manager, kIOHIDManagerOptionNone);
-    CFRelease(g_hid_manager);
+    IOHIDEventSystemClose(g_hid_system, NULL);
+    CFRelease(g_hid_system);
+    g_hid_system = NULL;
     return NULL;
-}
-
-static void log_hid_devices(void)
-{
-    struct hid_device_info *devs = hid_enumerate(0, 0);
-    if (!devs) return;
-
-    for (struct hid_device_info *cur = devs; cur; cur = cur->next) {
-        char name[128] = "?";
-        if (cur->product_string)
-            wcstombs(name, cur->product_string, sizeof(name));
-        fprintf(stderr, "[inputd]  HID: %s (vid=%04x pid=%04x page=0x%02x "
-                        "usage=0x%02x)\n",
-                name, cur->vendor_id, cur->product_id,
-                cur->usage_page, cur->usage);
-    }
-
-    hid_free_enumeration(devs);
 }
 
 static void mach_server_thread(void)
@@ -651,13 +800,6 @@ int main(void)
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
 
-    if (hid_init() != 0) {
-        fprintf(stderr, "[inputd] hid_init failed\n");
-        return 1;
-    }
-
-    log_hid_devices();
-
     kern_return_t kr = mach_port_allocate(mach_task_self(),
                                            MACH_PORT_RIGHT_RECEIVE,
                                            &g_server_port);
@@ -692,8 +834,6 @@ int main(void)
 
     send_device_removed(0);
     send_device_removed(1);
-
-    hid_exit();
 
     fprintf(stderr, "[inputd] shutting down\n");
     return 0;

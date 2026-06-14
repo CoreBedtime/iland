@@ -4,7 +4,6 @@ target_include_directories(inputd PRIVATE
     /opt/local/include
 )
 target_link_libraries(inputd PRIVATE
-    /opt/local/lib/libhidapi.dylib
     "-framework CoreFoundation"
     "-framework IOKit"
     "/System/Library/PrivateFrameworks/MultitouchSupport.framework"

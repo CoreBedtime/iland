@@ -96,6 +96,8 @@ static struct {
     volatile bool         running;
     bool                  connected;
     int                   pressed_keys;
+    int                   pressed_buttons;
+    uint32_t              button_state_mask;
 } g;
 
 static void queue_event(struct libinput_event *ev);
@@ -184,18 +186,40 @@ static void *recv_thread(void *arg)
                 ev->pointer.time_usec = msg->time_usec;
             }
             break;
-        case INPUT_IPC_EVENT_POINTER_BUTTON:
+        case INPUT_IPC_EVENT_POINTER_BUTTON: {
+            uint32_t btn_bit = 1u << (msg->pointer_button & 31);
+            int already_pressed = (g.button_state_mask & btn_bit) != 0;
+            if (msg->pointer_button_state == LIBINPUT_BUTTON_STATE_PRESSED) {
+                if (!already_pressed) {
+                    g.pressed_buttons++;
+                    g.button_state_mask |= btn_bit;
+                }
+            } else {
+                if (already_pressed) {
+                    g.pressed_buttons--;
+                    g.button_state_mask &= ~btn_bit;
+                }
+            }
             ev = alloc_event(LIBINPUT_EVENT_POINTER_BUTTON, dev);
             if (ev) {
                 ev->pointer.button = msg->pointer_button;
                 ev->pointer.button_state = msg->pointer_button_state;
+                ev->pointer.seat_button_count = g.pressed_buttons;
                 ev->pointer.time_usec = msg->time_usec;
             }
+            fprintf(stderr, "[libinput] button %u %s count=%d mask=0x%x\n",
+                    msg->pointer_button,
+                    msg->pointer_button_state ? "down" : "up",
+                    g.pressed_buttons, g.button_state_mask);
             break;
+        }
         case INPUT_IPC_EVENT_POINTER_AXIS:
             ev = alloc_event(LIBINPUT_EVENT_POINTER_AXIS, dev);
             if (ev) {
-                ev->pointer.axis_value[msg->pointer_axis] = msg->pointer_axis_value;
+                int axis = msg->pointer_axis;
+                if (axis >= 0 && axis < 2)
+                    ev->pointer.axis_value[axis] = msg->pointer_axis_value;
+                ev->pointer.axis_source = LIBINPUT_POINTER_AXIS_SOURCE_FINGER;
                 ev->pointer.time_usec = msg->time_usec;
             }
             break;
@@ -329,6 +353,7 @@ struct libinput *libinput_udev_create_context(
     (void)connected;
     memset(&g.ctx, 0, sizeof(g.ctx));
     g.ctx.user_data = user_data;
+    return &g.ctx;
 }
 
 struct libinput *libinput_unref(struct libinput *l)
