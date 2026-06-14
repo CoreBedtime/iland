@@ -395,14 +395,12 @@ int main(void)
         if (!g_display_surface) return 1;
 
         /* ── Initialise Metal pipeline ──────────────────────────────── */
-try_again_sister: {
-        g_mtl_device = MTLCreateSystemDefaultDevice();
+
+        g_mtl_device = MTLCopyAllDevices()[0];
         if (!g_mtl_device) {
             fprintf(stderr, "[framebufferd] Metal: no GPU device found\n");
-            goto try_again_sister;
             return 1;
         }
-}
 
         g_mtl_queue = [g_mtl_device newCommandQueue];
 
