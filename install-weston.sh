@@ -11,7 +11,7 @@ PLIST_DST="/Library/LaunchDaemons/$PLIST_NAME"
 
 if [ "$1" = "-u" ]; then
     echo "=== Uninstalling weston daemon ==="
-    launchctl load -w /System/Library/LaunchDaemons/com.apple.WindowServer.plist
+    sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.WindowServer.plist
     sudo launchctl bootout system/"$PLIST_NAME" 2>/dev/null || true
     sudo rm -f "$PLIST_DST"
     echo "=== Daemon removed ==="
