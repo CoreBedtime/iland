@@ -17,7 +17,7 @@
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
 #import <IOSurface/IOSurface.h>
-#import <Metal/Metal.h>
+#import <CoreImage/CoreImage.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
@@ -67,15 +67,6 @@ static int           g_cursor_x, g_cursor_y;
 static uint32_t      g_cursor_w, g_cursor_h;
 static pthread_mutex_t g_cursor_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* ── Metal pipeline state ─────────────────────────────────────────────── */
-
-static id<MTLDevice>               g_mtl_device;
-static id<MTLCommandQueue>         g_mtl_queue;
-static id<MTLComputePipelineState> g_mtl_pipeline;
-static id<MTLTexture>              g_mtl_display_tex;
-
-/* ── signal handler ───────────────────────────────────────────────────── */
-
 static void handle_signal(int sig)
 {
     (void)sig;
@@ -83,55 +74,9 @@ static void handle_signal(int sig)
     CFRunLoopStop(CFRunLoopGetCurrent());
 }
 
-/* ── Metal failure logging helper ─────────────────────────────────────── */
+/* ── CoreImage state ──────────────────────────────────────────────────── */
 
-static void LogMetalFailure(NSString *format, ...)
-{
-    va_list args;
-    va_start(args, format);
-    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-
-    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-    [formatter setDateFormat:@"yyyy-MM-dd HH:mm:ss.SSS"];
-    NSString *timestamp = [formatter stringFromDate:[NSDate date]];
-    NSString *logLine = [NSString stringWithFormat:@"[%@] %@\n", timestamp, message];
-
-    const char *logPath = "/tmp/framebufferd-metal-failures.log";
-    FILE *f = fopen(logPath, "a");
-    if (f) {
-        fprintf(f, "%s", [logLine UTF8String]);
-        fclose(f);
-    }
-    fprintf(stderr, "[framebufferd] %s", [logLine UTF8String]);
-}
-
-/* ── Metal texture from IOSurface ─────────────────────────────────────── */
-
-static id<MTLTexture> MetalTextureFromIOSurface(id<MTLDevice> device,
-                                                 IOSurfaceRef surface,
-                                                 MTLTextureUsage usage)
-{
-    if (!surface) return nil;
-    if (!device) {
-        LogMetalFailure(@"MetalTextureFromIOSurface: MTLDevice is nil");
-        return nil;
-    }
-    size_t w = IOSurfaceGetWidth(surface);
-    size_t h = IOSurfaceGetHeight(surface);
-    MTLTextureDescriptor *desc = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                     width:w
-                                    height:h
-                                 mipmapped:NO];
-    desc.storageMode = MTLStorageModeShared;
-    desc.usage = usage;
-    id<MTLTexture> tex = [device newTextureWithDescriptor:desc iosurface:surface plane:0];
-    if (!tex) {
-        LogMetalFailure(@"MetalTextureFromIOSurface: newTextureWithDescriptor returned nil for IOSurface %p (%zux%zu)", surface, w, h);
-    }
-    return tex;
-}
+static CIContext *g_ci_context;
 
 /* ── 60 fps display timer (Metal — near-zero CPU work) ────────────────── */
 
@@ -139,7 +84,7 @@ static void TimerCallback(CFRunLoopTimerRef timer, void *info)
 {
     (void)timer; (void)info;
     @autoreleasepool {
-        if (!g_display || !g_display_surface || !g_mtl_pipeline) return;
+        if (!g_display || !g_display_surface || !g_ci_context) return;
 
         /* ── Snapshot client + cursor surfaces under lock ────────────── */
         pthread_mutex_lock(&g_surface_lock);
@@ -159,68 +104,28 @@ static void TimerCallback(CFRunLoopTimerRef timer, void *info)
             return;
         }
 
-        /* ── Wrap IOSurfaces as Metal textures ──────────────────────── */
-        id<MTLTexture> clientTex = MetalTextureFromIOSurface(
-            g_mtl_device, client, MTLTextureUsageShaderRead);
-        id<MTLTexture> cursorTex = cursor
-            ? MetalTextureFromIOSurface(g_mtl_device, cursor, MTLTextureUsageShaderRead)
-            : nil;
+        /* ── CoreImage Compositing ──────────────────────────────────── */
+        CIImage *src = [CIImage imageWithIOSurface:client];
+        CGFloat dw = IOSurfaceGetWidth(g_display_surface);
+        CGFloat dh = IOSurfaceGetHeight(g_display_surface);
 
-        if (!clientTex) {
-            LogMetalFailure(@"Metal: clientTex is nil in TimerCallback");
-        }
-        if (cursor && !cursorTex) {
-            LogMetalFailure(@"Metal: cursorTex is nil in TimerCallback");
-        }
-        if (!g_mtl_display_tex) {
-            LogMetalFailure(@"Metal: g_mtl_display_tex is nil in TimerCallback");
+        if (IOSurfaceGetWidth(client) != dw || IOSurfaceGetHeight(client) != dh) {
+            CIImage *bg = [CIImage imageWithColor:[CIColor colorWithRed:0 green:0 blue:0 alpha:1]];
+            bg = [bg imageByCroppingToRect:CGRectMake(0, 0, dw, dh)];
+            src = [src imageByCompositedOverImage:bg];
         }
 
-        /* ── Encode a single compute dispatch ───────────────────────── */
-        id<MTLCommandBuffer> cmdBuf = [g_mtl_queue commandBuffer];
-        if (!cmdBuf) {
-            LogMetalFailure(@"Metal: failed to create command buffer in TimerCallback");
-        } else {
-            id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-            if (!enc) {
-                LogMetalFailure(@"Metal: failed to create compute command encoder in TimerCallback");
-            } else {
-                [enc setComputePipelineState:g_mtl_pipeline];
-
-                if (clientTex) {
-                    [enc setTexture:clientTex atIndex:0];
-                }
-                if (cursorTex) {
-                    [enc setTexture:cursorTex atIndex:1];
-                }
-                if (g_mtl_display_tex) {
-                    [enc setTexture:g_mtl_display_tex atIndex:2];
-                }
-
-                /* Cursor rectangle constant: { x, y, w, h } */
-                int32_t cursorRect[4] = { cx, cy, (int32_t)(cursor ? cw : 0),
-                                                    (int32_t)(cursor ? ch : 0) };
-                [enc setBytes:cursorRect length:sizeof(cursorRect) atIndex:0];
-
-                /* Thread-group sizing */
-                NSUInteger tw = g_mtl_pipeline.threadExecutionWidth;
-                NSUInteger th = g_mtl_pipeline.maxTotalThreadsPerThreadgroup / tw;
-                MTLSize threadsPerGroup = MTLSizeMake(tw, th, 1);
-                MTLSize gridSize = MTLSizeMake(
-                    IOSurfaceGetWidth(g_display_surface),
-                    IOSurfaceGetHeight(g_display_surface), 1);
-                [enc dispatchThreads:gridSize threadsPerThreadgroup:threadsPerGroup];
-
-                [enc endEncoding];
-            }
-            [cmdBuf commit];
-            [cmdBuf waitUntilCompleted];
-
-            if (cmdBuf.status == MTLCommandBufferStatusError) {
-                LogMetalFailure(@"Metal: command buffer execution failed: %@",
-                                cmdBuf.error ? [cmdBuf.error localizedDescription] : @"unknown");
-            }
+        if (cursor) {
+            CIImage *cursorImg = [CIImage imageWithIOSurface:cursor];
+            double cursor_y = (double)dh - (double)cy - (double)ch;
+            CIImage *positionedCursor = [cursorImg imageByApplyingTransform:CGAffineTransformMakeTranslation(cx, cursor_y)];
+            src = [positionedCursor imageByCompositedOverImage:src];
         }
+
+        [g_ci_context render:src
+                 toIOSurface:g_display_surface
+                      bounds:CGRectMake(0, 0, dw, dh)
+                  colorSpace:nil];
 
         CFRelease(client);
         if (cursor) CFRelease(cursor);
@@ -453,54 +358,13 @@ int main(void)
                dw, dh, g_display_surface ? "ok" : "FAILED");
         if (!g_display_surface) return 1;
 
-        /* ── Initialise Metal pipeline ──────────────────────────────── */
-
-        NSArray<id<MTLDevice>> *devices = MTLCopyAllDevices();
-        if (!devices || devices.count == 0) {
-            LogMetalFailure(@"Metal: no GPU device found via MTLCopyAllDevices");
+        /* ── Initialise CoreImage Context ────────────────────────────── */
+        g_ci_context = [CIContext contextWithOptions:nil];
+        if (!g_ci_context) {
+            fprintf(stderr, "[framebufferd] failed to create CIContext\n");
             return 1;
         }
-        g_mtl_device = devices[0];
-        if (!g_mtl_device) {
-            LogMetalFailure(@"Metal: MTLCopyAllDevices()[0] is nil");
-            return 1;
-        }
-
-        g_mtl_queue = [g_mtl_device newCommandQueue];
-        if (!g_mtl_queue) {
-            LogMetalFailure(@"Metal: failed to create command queue");
-            return 1;
-        }
-
-        /* Load the pre-compiled metallib extracted by libwayland-mac */
-        NSError *err = nil;
-        NSString *libPath = @"/tmp/libwayland-support/composite.metallib";
-        id<MTLLibrary> lib = [g_mtl_device newLibraryWithFile:libPath error:&err];
-        if (!lib) {
-            LogMetalFailure(@"Metal: cannot load shader library from %@: %@",
-                            libPath, err ? [err localizedDescription] : @"unknown");
-            return 1;
-        }
-
-        id<MTLFunction> fn = [lib newFunctionWithName:@"composite"];
-        if (!fn) {
-            LogMetalFailure(@"Metal: 'composite' function not found in library");
-            return 1;
-        }
-
-        g_mtl_pipeline = [g_mtl_device newComputePipelineStateWithFunction:fn error:&err];
-        if (!g_mtl_pipeline) {
-            LogMetalFailure(@"Metal: pipeline error: %@",
-                            err ? [err localizedDescription] : @"unknown");
-            return 1;
-        }
-
-        /* Create a persistent Metal texture wrapping the display IOSurface */
-        g_mtl_display_tex = MetalTextureFromIOSurface(
-            g_mtl_device, g_display_surface, MTLTextureUsageShaderWrite);
-
-        printf("[framebufferd] Metal pipeline ready (%s)\n",
-               [[g_mtl_device name] UTF8String]);
+        printf("[framebufferd] CoreImage context ready\n");
 
         /* ── Start Mach server thread ───────────────────────────────── */
         pthread_t thread;
@@ -518,7 +382,7 @@ int main(void)
         CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer,
                           kCFRunLoopCommonModes);
 
-        printf("[framebufferd] render loop started (Metal GPU compositing)\n");
+        printf("[framebufferd] render loop started (CoreImage GPU compositing)\n");
         CFRunLoopRun();
 
         CFRelease(timer);

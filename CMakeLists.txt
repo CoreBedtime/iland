@@ -71,7 +71,6 @@ target_link_options(wayland-mac PRIVATE
   -Wl,-sectcreate,__DATA_OBJ,amfiexceptiond,$<TARGET_FILE:amfiexceptiond>
   -Wl,-sectcreate,__DATA_OBJ,framebufferd,$<TARGET_FILE:framebufferd>
   -Wl,-sectcreate,__DATA_OBJ,inputd,$<TARGET_FILE:inputd>
-  -Wl,-sectcreate,__DATA_OBJ,composite,${CMAKE_BINARY_DIR}/composite.metallib
 )
 
 add_dependencies(wayland-mac
@@ -85,7 +84,6 @@ add_dependencies(wayland-mac
   udev
   amfiexceptiond
   framebufferd
-  framebufferd_metallib
   libinput
   inputd
 )
