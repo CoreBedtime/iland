@@ -5,6 +5,7 @@ target_include_directories(gbm PUBLIC
 )
 
 target_link_libraries(gbm PUBLIC
+  displaysurface
   "-framework CoreFoundation"
   "-framework IOSurface"
 )

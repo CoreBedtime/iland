@@ -6,6 +6,7 @@ target_include_directories(drm PUBLIC
 )
 
 target_link_libraries(drm PUBLIC
+  displaysurface
   "-framework CoreFoundation"
   "-framework IOSurface"
   "-framework CoreGraphics"

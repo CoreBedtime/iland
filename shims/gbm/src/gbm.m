@@ -4,6 +4,7 @@
 #import <stdlib.h>
 #import <string.h>
 #import <errno.h>
+#import "DisplaySurface.h"
 
 /* Register GBM buffer handles so drmModeAddFB can resolve them. */
 extern void drm_register_gbm_buffer(uint32_t handle, void *surface);
@@ -13,17 +14,8 @@ static IOSurfaceRef create_iosurface(uint32_t width, uint32_t height,
                                       uint32_t format)
 {
     (void)format;
-    uint32_t stride = width * 4;
-    size_t total = stride * height;
-
-    NSMutableDictionary *dict = [NSMutableDictionary dictionary];
-    [dict setObject:@(width)       forKey:(id)kIOSurfaceWidth];
-    [dict setObject:@(height)      forKey:(id)kIOSurfaceHeight];
-    [dict setObject:@((int)'BGRA') forKey:(id)kIOSurfacePixelFormat];
-    [dict setObject:@(stride)      forKey:(id)kIOSurfaceBytesPerRow];
-    [dict setObject:@(total)       forKey:(id)kIOSurfaceAllocSize];
-
-    return IOSurfaceCreate((CFDictionaryRef)dict);
+    DisplaySurfaceInfo dsi = DisplaySurface_create(width, height, kWSPixelFormatBGRA);
+    return dsi.surface;
 }
 
 struct gbm_device *gbm_create_device(int fd)
@@ -61,10 +53,10 @@ struct gbm_surface *gbm_surface_create(struct gbm_device *gbm,
         bo->device = gbm;
         bo->width  = width;
         bo->height = height;
-        bo->stride = width * 4;
-        bo->format = format;
         bo->surface = create_iosurface(width, height, format);
         if (!bo->surface) { free(bo); goto fail; }
+        bo->stride = (uint32_t)IOSurfaceGetBytesPerRow(bo->surface);
+        bo->format = format;
         drm_register_gbm_buffer((uint32_t)IOSurfaceGetID(bo->surface),
                                 (void*)bo->surface);
         surf->bos[i] = bo;
@@ -193,10 +185,10 @@ struct gbm_bo *gbm_bo_create(struct gbm_device *gbm,
     bo->device = gbm;
     bo->width  = width;
     bo->height = height;
-    bo->stride = width * 4;
-    bo->format = format;
     bo->surface = create_iosurface(width, height, format);
     if (!bo->surface) { free(bo); return NULL; }
+    bo->stride = (uint32_t)IOSurfaceGetBytesPerRow(bo->surface);
+    bo->format = format;
     drm_register_gbm_buffer((uint32_t)IOSurfaceGetID(bo->surface),
                             (void*)bo->surface);
     return bo;

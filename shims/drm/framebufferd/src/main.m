@@ -17,7 +17,6 @@
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
 #import <IOSurface/IOSurface.h>
-#import <Accelerate/Accelerate.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
@@ -51,21 +50,12 @@ static uint8_t *fake_event_caps;
 static mach_port_t   g_server_port  = MACH_PORT_NULL;
 static id            g_display;          /* CAWindowServerDisplay */
 
-/* Our own display surface — created by DisplaySurface_create */
-static IOSurfaceRef  g_display_surface;
-
-/* The latest client surface (retained) — pixel source for blit */
+/* The latest client surface (retained) — directly presentable */
 static IOSurfaceRef  g_client_surface;
 
 static pthread_mutex_t g_surface_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile bool g_running = true;
-
-/* ── cursor state ─────────────────────────────────────────────────────── */
-
-static IOSurfaceRef  g_cursor_surface;
-static int           g_cursor_x, g_cursor_y;
-static uint32_t      g_cursor_w, g_cursor_h;
-static pthread_mutex_t g_cursor_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile bool g_dirty = false;
 
 static void handle_signal(int sig)
 {
@@ -74,143 +64,29 @@ static void handle_signal(int sig)
     CFRunLoopStop(CFRunLoopGetCurrent());
 }
 
-/* ── Dirty tracking state ─────────────────────────────────────────────── */
-static volatile bool g_dirty = true;
-
-/* ── 60 fps display timer (Accelerate/vImage CPU compositing) ─────────── */
+/* ── Present timer (main thread) ──────────────────────────────────────── */
 
 static void TimerCallback(CFRunLoopTimerRef timer, void *info)
 {
     (void)timer; (void)info;
     @autoreleasepool {
-        if (!g_display || !g_display_surface) return;
-
+        if (!g_display) return;
         if (!g_dirty) return;
         g_dirty = false;
 
-        /* ── Snapshot client + cursor surfaces under lock ────────────── */
+        /* Snapshot client surface under lock */
         pthread_mutex_lock(&g_surface_lock);
         IOSurfaceRef client = g_client_surface;
         if (client) CFRetain(client);
         pthread_mutex_unlock(&g_surface_lock);
 
-        pthread_mutex_lock(&g_cursor_lock);
-        IOSurfaceRef cursor = g_cursor_surface;
-        if (cursor) CFRetain(cursor);
-        int cx = g_cursor_x, cy = g_cursor_y;
-        uint32_t cw = g_cursor_w, ch = g_cursor_h;
-        pthread_mutex_unlock(&g_cursor_lock);
+        if (!client) return;
 
-        if (!client) {
-            if (cursor) CFRelease(cursor);
-            return;
-        }
-
-        /* ── Accelerate / vImage Compositing ────────────────────────── */
-        IOSurfaceLock(client, kIOSurfaceLockReadOnly, NULL);
-        if (cursor) {
-            IOSurfaceLock(cursor, kIOSurfaceLockReadOnly, NULL);
-        }
-        IOSurfaceLock(g_display_surface, 0, NULL);
-
-        vImage_Buffer srcBuf = {
-            .data = IOSurfaceGetBaseAddress(client),
-            .width = IOSurfaceGetWidth(client),
-            .height = IOSurfaceGetHeight(client),
-            .rowBytes = IOSurfaceGetBytesPerRow(client)
-        };
-        vImage_Buffer dstBuf = {
-            .data = IOSurfaceGetBaseAddress(g_display_surface),
-            .width = IOSurfaceGetWidth(g_display_surface),
-            .height = IOSurfaceGetHeight(g_display_surface),
-            .rowBytes = IOSurfaceGetBytesPerRow(g_display_surface)
-        };
-
-        if (srcBuf.data && dstBuf.data) {
-            if (srcBuf.width == dstBuf.width && srcBuf.height == dstBuf.height) {
-                if (srcBuf.rowBytes == dstBuf.rowBytes) {
-                    memcpy(dstBuf.data, srcBuf.data, srcBuf.rowBytes * srcBuf.height);
-                } else {
-                    size_t bytesToCopy = srcBuf.width * 4;
-                    uint8_t *srcPtr = srcBuf.data;
-                    uint8_t *dstPtr = dstBuf.data;
-                    for (size_t y = 0; y < srcBuf.height; y++) {
-                        memcpy(dstPtr, srcPtr, bytesToCopy);
-                        srcPtr += srcBuf.rowBytes;
-                        dstPtr += dstBuf.rowBytes;
-                    }
-                }
-            } else {
-                vImageScale_ARGB8888(&srcBuf, &dstBuf, NULL, kvImageNoFlags);
-            }
-
-            if (cursor) {
-                vImage_Buffer cursorBuf = {
-                    .data = IOSurfaceGetBaseAddress(cursor),
-                    .width = IOSurfaceGetWidth(cursor),
-                    .height = IOSurfaceGetHeight(cursor),
-                    .rowBytes = IOSurfaceGetBytesPerRow(cursor)
-                };
-
-                if (cursorBuf.data) {
-                    int dw_int = (int)dstBuf.width;
-                    int dh_int = (int)dstBuf.height;
-
-                    int x_min = cx;
-                    int y_min = cy;
-                    int x_max = cx + (int)cw;
-                    int y_max = cy + (int)ch;
-
-                    if (x_min < 0) x_min = 0;
-                    if (y_min < 0) y_min = 0;
-                    if (x_max > dw_int) x_max = dw_int;
-                    if (y_max > dh_int) y_max = dh_int;
-
-                    int intersect_w = x_max - x_min;
-                    int intersect_h = y_max - y_min;
-
-                    if (intersect_w > 0 && intersect_h > 0) {
-                        uint8_t *dst_start = (uint8_t *)dstBuf.data + y_min * dstBuf.rowBytes + x_min * 4;
-                        vImage_Buffer subDstBuf = {
-                            .data = dst_start,
-                            .width = intersect_w,
-                            .height = intersect_h,
-                            .rowBytes = dstBuf.rowBytes
-                        };
-
-                        int cursor_x_offset = x_min - cx;
-                        int cursor_y_offset = y_min - cy;
-                        uint8_t *cursor_start = (uint8_t *)cursorBuf.data + cursor_y_offset * cursorBuf.rowBytes + cursor_x_offset * 4;
-
-                        vImage_Buffer subCursorBuf = {
-                            .data = cursor_start,
-                            .width = intersect_w,
-                            .height = intersect_h,
-                            .rowBytes = cursorBuf.rowBytes
-                        };
-
-                        vImagePremultipliedAlphaBlend_ARGB8888(
-                            &subCursorBuf,
-                            &subDstBuf,
-                            &subDstBuf,
-                            kvImageNoFlags
-                        );
-                    }
-                }
-            }
-        }
-
-        IOSurfaceUnlock(g_display_surface, 0, NULL);
-        if (cursor) {
-            IOSurfaceUnlock(cursor, kIOSurfaceLockReadOnly, NULL);
-        }
-        IOSurfaceUnlock(client, kIOSurfaceLockReadOnly, NULL);
-
+        /* Directly present the client surface — no compositing needed.
+         * The surface was created via DisplaySurface_create() with the
+         * same format/properties as the display pipeline. */
+        [g_display presentSurface:client withOptions:@{}];
         CFRelease(client);
-        if (cursor) CFRelease(cursor);
-
-        /* Present our display surface to the CAWindowServer */
-        [g_display presentSurface:g_display_surface withOptions:@{}];
     }
 }
 
@@ -252,26 +128,11 @@ static void *mach_server_thread(void *arg)
 
         /* Route message by operation type */
         if (strstr(msg.json, "\"op\":\"cursor_set\"")) {
-            /* Cursor set — store the cursor surface + dimensions */
-            pthread_mutex_lock(&g_cursor_lock);
-            if (g_cursor_surface) CFRelease(g_cursor_surface);
-            g_cursor_surface = client_surface;
-            g_cursor_w = 64; g_cursor_h = 64;
-            /* Try to parse w/h from JSON */
-            sscanf(msg.json, "%*[^w]w\":%u,\"h\":%u",
-                   &g_cursor_w, &g_cursor_h);
-            g_dirty = true;
-            pthread_mutex_unlock(&g_cursor_lock);
+            if (client_surface) CFRelease(client_surface);
         } else if (strstr(msg.json, "\"op\":\"cursor_move\"")) {
-            /* Cursor move — update position */
-            pthread_mutex_lock(&g_cursor_lock);
-            sscanf(msg.json, "%*[^x]x\":%d,\"y\":%d",
-                   &g_cursor_x, &g_cursor_y);
-            g_dirty = true;
-            pthread_mutex_unlock(&g_cursor_lock);
             if (client_surface) CFRelease(client_surface);
         } else if (client_surface) {
-            /* Default: treat as page flip / surface update */
+            /* Page flip — store the client surface for presentation */
             pthread_mutex_lock(&g_surface_lock);
             if (g_client_surface) CFRelease(g_client_surface);
             g_client_surface = client_surface;
@@ -351,13 +212,6 @@ int main(void)
 
         /* ── Set up CAWindowServer display pipeline ──────────────────── */
 
-        /*
-         * Mirror FrameBufferService exactly:
-         *   a) dlopen private frameworks
-         *   b) resolve ALL symbols upfront via SymRez
-         *   c) call init functions unconditionally in order
-         */
-
         /* a) Load private frameworks so SymRez can find them */
         dlopen("/System/Library/Frameworks/CoreDisplay.framework/Versions/A/CoreDisplay",
                RTLD_LAZY);
@@ -429,51 +283,12 @@ int main(void)
         printf("[framebufferd] CAWindowServer ready, display=%s\n",
                g_display ? "yes" : "no");
 
-        /* ── Create our own display surface ─────────────────────────── */
-
-        uint32_t dw = 0, dh = 0;
-        get_display_resolution(&dw, &dh);
-
-        DisplaySurfaceInfo dsi = DisplaySurface_create(dw, dh, kWSPixelFormatBGRA);
-        g_display_surface = dsi.surface;
-        printf("[framebufferd] display surface %ux%u (%s)\n",
-               dw, dh, g_display_surface ? "ok" : "FAILED");
-        if (!g_display_surface) return 1;
-
         /* ── Start Mach server thread ───────────────────────────────── */
         pthread_t thread;
         pthread_create(&thread, NULL, mach_server_thread, NULL);
         pthread_detach(thread);
 
-        /* ── Determine display refresh rate using CAWindowServerDisplay ── */
-        double refreshRate = 60.0;
-        if (g_display) {
-            float idealRate = 0.0f;
-            float maxRate = 0.0f;
-            SEL selIdeal = NSSelectorFromString(@"idealRefreshRate");
-            SEL selMax = NSSelectorFromString(@"maximumRefreshRate");
-
-            if ([g_display respondsToSelector:selIdeal]) {
-                idealRate = ((float (*)(id, SEL))objc_msgSend)(g_display, selIdeal);
-            }
-            if ([g_display respondsToSelector:selMax]) {
-                maxRate = ((float (*)(id, SEL))objc_msgSend)(g_display, selMax);
-            }
-
-            if (idealRate > 0.0f) {
-                refreshRate = idealRate;
-            } else if (maxRate > 0.0f) {
-                refreshRate = maxRate;
-            } else {
-                /* Default/Fallback for ProMotion or unknown display */
-                refreshRate = 120.0;
-            }
-        }
-        if (refreshRate < 60.0) {
-            refreshRate = 60.0;
-        }
-
-        /* ── Render loop (synced to display refresh rate) ───────────── */
+        /* ── Present timer — fires on main thread, presents latest surface ── */
         CFRunLoopTimerRef timer = CFRunLoopTimerCreate(
             kCFAllocatorDefault,
             CFAbsoluteTimeGetCurrent(),
@@ -484,7 +299,7 @@ int main(void)
         CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer,
                           kCFRunLoopCommonModes);
 
-        printf("[framebufferd] render loop started at %.1f FPS (Accelerate CPU compositing)\n", refreshRate);
+        printf("[framebufferd] direct-present mode (zero-copy, 120Hz poll)\n");
         CFRunLoopRun();
 
         CFRelease(timer);
@@ -492,7 +307,6 @@ int main(void)
 
         pthread_mutex_lock(&g_surface_lock);
         if (g_client_surface) { CFRelease(g_client_surface); g_client_surface = NULL; }
-        if (g_display_surface) { CFRelease(g_display_surface); g_display_surface = NULL; }
         pthread_mutex_unlock(&g_surface_lock);
     }
     return 0;

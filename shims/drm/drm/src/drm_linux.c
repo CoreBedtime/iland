@@ -1,6 +1,7 @@
 #include "drm_linux.h"
 #include "drm.h"
 #include "drm_ioctl.h"
+#include "DisplaySurface.h"
 
 #include <IOSurface/IOSurface.h>
 #include <errno.h>
@@ -375,38 +376,16 @@ int drmModeCreateDumbBuffer(int fd, uint32_t width, uint32_t height,
     }
     if (slot < 0) { errno = ENOMEM; return -1; }
 
-    uint32_t bpe = (bpp + 7) / 8;
-    uint32_t p   = (width * bpe + 63) & ~63u;
-    size_t   sz  = (size_t)p * height;
-
-    /* Create a real IOSurface */
-    CFMutableDictionaryRef props = CFDictionaryCreateMutable(
-        kCFAllocatorDefault, 0,
-        &kCFTypeDictionaryKeyCallBacks,
-        &kCFTypeDictionaryValueCallBacks);
-
-    CFNumberRef num;
-    num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &width);
-    CFDictionarySetValue(props, kIOSurfaceWidth, num);
-    CFRelease(num);
-
-    num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &height);
-    CFDictionarySetValue(props, kIOSurfaceHeight, num);
-    CFRelease(num);
-
-    num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &bpe);
-    CFDictionarySetValue(props, kIOSurfaceBytesPerElement, num);
-    CFRelease(num);
-
-    uint32_t pf = 'BGRA';
-    num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pf);
-    CFDictionarySetValue(props, kIOSurfacePixelFormat, num);
-    CFRelease(num);
-
-    IOSurfaceRef surf = IOSurfaceCreate(props);
-    CFRelease(props);
-
+    /* Create a display-compatible IOSurface via DisplaySurface_create().
+     * This ensures the surface has the same pixel format, cache mode, and
+     * properties as the CAWindowServer display pipeline, enabling
+     * framebufferd to directly present it without any blitting. */
+    DisplaySurfaceInfo dsi = DisplaySurface_create(width, height, kWSPixelFormatBGRA);
+    IOSurfaceRef surf = dsi.surface;
     if (!surf) { errno = ENOMEM; return -1; }
+
+    uint32_t p   = (uint32_t)IOSurfaceGetBytesPerRow(surf);
+    size_t   sz  = (size_t)IOSurfaceGetAllocSize(surf);
 
     /* Lock and get base address so the compositor can write pixels */
     IOSurfaceLock(surf, 0, NULL);
@@ -1224,8 +1203,8 @@ int drmModeDestroyPropertyBlob(int fd, uint32_t blob_id)
 
 /* ── plane resources ─────────────────────────────────────────────────── */
 
-/* Virtual planes: 1=primary, 2=cursor, 3=overlay (all assoc. with CRTC 1) */
-static const uint32_t g_plane_ids[] = { 1, 2, 3 };
+/* Virtual planes: only primary plane (1) to force software cursor fallback */
+static const uint32_t g_plane_ids[] = { 1 };
 #define G_PLANE_COUNT  ((int)(sizeof(g_plane_ids)/sizeof(g_plane_ids[0])))
 
 /* default supported formats per plane */
@@ -1451,50 +1430,16 @@ static struct {
 int drmModeSetCursor(int fd, uint32_t crtc_id, uint32_t bo_handle,
                      uint32_t width, uint32_t height)
 {
-    if (check_fd(fd) < 0) return -1;
-    if (crtc_id != 1) { errno = ENOENT; return -1; }
-
-    g_cursor.crtc_id   = crtc_id;
-    g_cursor.bo_handle = bo_handle;
-    g_cursor.width     = width;
-    g_cursor.height    = height;
-    g_cursor.active    = true;
-
-    /* Send cursor surface to framebufferd */
-    IOSurfaceRef surf = NULL;
-    for (int i = 0; i < MAX_DUMB_BUFS; i++)
-        if (g_dumb[i].handle == bo_handle) { surf = g_dumb[i].surface; break; }
-
-    if (surf) {
-        mach_port_t surface_port = IOSurfaceCreateMachPort(surf);
-        char buf[256];
-        snprintf(buf, sizeof(buf),
-                 "{\"op\":\"cursor_set\",\"crtc\":%u,\"w\":%u,\"h\":%u}",
-                 crtc_id, width, height);
-        drm_send_json_with_surface(buf, surface_port);
-        if (surface_port != MACH_PORT_NULL)
-            mach_port_deallocate(mach_task_self(), surface_port);
-    }
-
-    return 0;
+    (void)fd; (void)crtc_id; (void)bo_handle; (void)width; (void)height;
+    errno = ENOTSUP;
+    return -1;
 }
 
 int drmModeMoveCursor(int fd, uint32_t crtc_id, int x, int y)
 {
-    if (check_fd(fd) < 0) return -1;
-    if (crtc_id != 1) { errno = ENOENT; return -1; }
-
-    g_cursor.x = x;
-    g_cursor.y = y;
-
-    if (g_cursor.active) {
-        char buf[256];
-        snprintf(buf, sizeof(buf),
-                 "{\"op\":\"cursor_move\",\"crtc\":%u,\"x\":%d,\"y\":%d}",
-                 crtc_id, x, y);
-        drm_send_json(buf);
-    }
-    return 0;
+    (void)fd; (void)crtc_id; (void)x; (void)y;
+    errno = ENOTSUP;
+    return -1;
 }
 
 /* ── sync objects ────────────────────────────────────────────────────── */

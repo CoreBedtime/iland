@@ -4,7 +4,7 @@
 #include "gbm.h"
 #include <IOSurface/IOSurface.h>
 
-#define GBM_NUM_BUFFERS 3
+#define GBM_NUM_BUFFERS 4
 
 struct gbm_device {
     int fd;
