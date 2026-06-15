@@ -36,6 +36,10 @@ sudo tee "$PLIST_DST" > /dev/null << PLIST
     <true/>
     <key>KeepAlive</key>
     <false/>
+	<key>POSIXSpawnType</key>
+	<string>Interactive</string>
+	<key>EnablePressuredExit</key>
+	<false/>
     <key>StandardOutPath</key>
     <string>/tmp/weston-stdout.log</string>
     <key>StandardErrorPath</key>
