@@ -21,6 +21,7 @@ set(Dobby_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(Dobby_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(dobby)
 
+add_subdirectory(shims/sdl)
 add_subdirectory(shims/epoll)
 # Override the epoll-shim's -fvisibility=hidden so its symbols are
 # exported from the wayland-mac dylib.
@@ -35,7 +36,7 @@ add_subdirectory(shims/wayland)
 add_subdirectory(shims/libinput)
 add_subdirectory(shims/udev)
 
-# --- Output dylib: absorbs all shims, embeds amfiexceptiond + framebufferd + inputd ---
+# --- Output dylib: single-library SDL mode (no daemons) ---
 add_library(wayland-mac SHARED shims/wayland-mac.c)
 
 target_link_libraries(wayland-mac PRIVATE
@@ -48,29 +49,39 @@ target_link_libraries(wayland-mac PRIVATE
   -Wl,-force_load,$<TARGET_FILE:egl-shim>
   -Wl,-force_load,$<TARGET_FILE:udev>
   -Wl,-force_load,$<TARGET_FILE:libinput>
+  -Wl,-force_load,$<TARGET_FILE:sdl-backend>
 )
 
 # Expose all shim APIs via the single umbrella header <wayland-mac.h>.
 # Shim-specific headers (epoll, drm) are propagated transitively through
 # each library target's PUBLIC include directories.
 target_link_libraries(wayland-mac PUBLIC drm gbm egl-shim)
-target_link_libraries(wayland-mac PRIVATE "-framework Foundation" "-lobjc")
+target_link_libraries(wayland-mac PRIVATE
+  "-framework Foundation" "-lobjc" "-framework IOSurface"
+  "-framework Cocoa" "-framework IOKit" "-framework CoreVideo"
+  "-framework CoreAudio" "-framework AudioToolbox" "-framework AVFoundation"
+  "-framework GameController" "-framework Metal" "-framework QuartzCore"
+  "-framework Carbon" "-framework ForceFeedback" "-framework CoreMedia"
+  "-lSDL3"
+)
+target_link_directories(wayland-mac PRIVATE /opt/local/lib)
 target_include_directories(wayland-mac PRIVATE
   ${CMAKE_SOURCE_DIR}/shims/epoll/src
+  ${CMAKE_SOURCE_DIR}/shims/sdl/include
+  /opt/local/include
 )
 target_include_directories(wayland-mac PUBLIC
   ${CMAKE_SOURCE_DIR}/shims
   ${CMAKE_SOURCE_DIR}/shims/include
   ${CMAKE_SOURCE_DIR}/shims/gbm/include
   ${CMAKE_SOURCE_DIR}/shims/glibc/include
+  ${CMAKE_SOURCE_DIR}/shims/sdl/include
   $<TARGET_PROPERTY:epoll-shim-interpose,INTERFACE_INCLUDE_DIRECTORIES>
 )
 
 target_link_options(wayland-mac PRIVATE
   -Wl,-rpath,${CMAKE_BINARY_DIR}
-  -Wl,-sectcreate,__DATA_OBJ,amfiexceptiond,$<TARGET_FILE:amfiexceptiond>
-  -Wl,-sectcreate,__DATA_OBJ,framebufferd,$<TARGET_FILE:framebufferd>
-  -Wl,-sectcreate,__DATA_OBJ,inputd,$<TARGET_FILE:inputd>
+  -Wl,-rpath,/opt/local/lib
 )
 
 add_dependencies(wayland-mac
@@ -82,10 +93,8 @@ add_dependencies(wayland-mac
   glibc-compat
   wayland
   udev
-  amfiexceptiond
-  framebufferd
   libinput
-  inputd
+  sdl-backend
 )
 
 add_subdirectory(test)

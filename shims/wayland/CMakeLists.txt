@@ -1,5 +1,3 @@
-add_subdirectory(amfi)
-
 add_library(wayland STATIC
     src/wayland-server.c
 )

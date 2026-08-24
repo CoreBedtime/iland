@@ -2,6 +2,7 @@
 #include "drm.h"
 #include "drm_ioctl.h"
 #include "DisplaySurface.h"
+#include "sdl_backend.h"
 
 #include <IOSurface/IOSurface.h>
 #include <errno.h>
@@ -11,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <mach/mach.h>
+#include <pthread.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -19,7 +21,54 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 
-static drmModeModeInfo g_modes[4];
+static int get_display_count(void);
+static void get_display_bounds(int idx, uint32_t *w, uint32_t *h, int *x, int *y);
+
+/* Stable, single snapshot of the active display list. Index 0 is the main
+ * display. This is the ONE source of truth for crtc<->display mapping, shared
+ * by the DRM mode enumeration and the SDL window placement so the two never
+ * disagree on which physical display a CRTC refers to. */
+#define MAX_DISPLAYS 16
+static CGDirectDisplayID g_displays[MAX_DISPLAYS];
+static int g_display_count = 0;
+
+static void ensure_displays(void) {
+    if (g_display_count > 0) return;
+    uint32_t count = 0;
+    CGGetActiveDisplayList(0, NULL, &count);
+    if (count == 0) {
+        g_displays[0] = CGMainDisplayID();
+        g_display_count = 1;
+        return;
+    }
+    if (count > MAX_DISPLAYS) count = MAX_DISPLAYS;
+    CGGetActiveDisplayList(count, g_displays, &count);
+    /* Put the main display first so crtc 1 == primary monitor. */
+    CGDirectDisplayID main = CGMainDisplayID();
+    if (g_displays[0] != main) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (g_displays[i] == main) {
+                CGDirectDisplayID tmp = g_displays[0];
+                g_displays[0] = main;
+                g_displays[i] = tmp;
+                break;
+            }
+        }
+    }
+    g_display_count = (int)count;
+}
+
+/* Public (used by the SDL backend for window placement). */
+int mac_display_count(void) { ensure_displays(); return g_display_count; }
+void mac_display_bounds(int idx, int *x, int *y, int *w, int *h) {
+    ensure_displays();
+    if (idx < 0 || idx >= g_display_count) { *x=0;*y=0;*w=1920;*h=1080; return; }
+    CGRect b = CGDisplayBounds(g_displays[idx]);
+    *x = (int)b.origin.x; *y = (int)b.origin.y;
+    *w = (int)b.size.width; *h = (int)b.size.height;
+}
+
+static drmModeModeInfo g_modes[8];
 static int g_mode_count;
 
 static uint32_t get_display_refresh_rate(void)
@@ -47,92 +96,129 @@ static void init_modes(void)
 {
     if (g_mode_count > 0) return;
 
-    uint32_t pw = 1920, ph = 1080;
-
-    CFURLRef url = CFURLCreateWithFileSystemPath(NULL,
-        CFSTR("/Library/Preferences/com.apple.windowserver.displays.plist"),
-        kCFURLPOSIXPathStyle, false);
-    CFReadStreamRef stream = CFReadStreamCreateWithFile(NULL, url);
-    if (stream && CFReadStreamOpen(stream)) {
-        CFPropertyListRef plist = CFPropertyListCreateWithStream(NULL,
-            stream, 0, kCFPropertyListImmutable, NULL, NULL);
-        if (plist && CFGetTypeID(plist) == CFDictionaryGetTypeID()) {
-            CFDictionaryRef userSets = CFDictionaryGetValue(plist, CFSTR("DisplayAnyUserSets"));
-            if (userSets && CFGetTypeID(userSets) == CFDictionaryGetTypeID()) {
-                CFArrayRef configs = CFDictionaryGetValue(userSets, CFSTR("Configs"));
-                if (configs && CFGetTypeID(configs) == CFArrayGetTypeID()) {
-                    for (CFIndex i = 0; i < CFArrayGetCount(configs); i++) {
-                        CFDictionaryRef cfg = CFArrayGetValueAtIndex(configs, i);
-                        if (!cfg || CFGetTypeID(cfg) != CFDictionaryGetTypeID()) continue;
-                        CFArrayRef dispCfg = CFDictionaryGetValue(cfg, CFSTR("DisplayConfig"));
-                        if (!dispCfg || CFGetTypeID(dispCfg) != CFArrayGetTypeID()) continue;
-                        for (CFIndex j = 0; j < CFArrayGetCount(dispCfg); j++) {
-                            CFDictionaryRef disp = CFArrayGetValueAtIndex(dispCfg, j);
-                            if (!disp || CFGetTypeID(disp) != CFDictionaryGetTypeID()) continue;
-                            CFDictionaryRef info = CFDictionaryGetValue(disp, CFSTR("CurrentInfo"));
-                            if (!info || CFGetTypeID(info) != CFDictionaryGetTypeID()) continue;
-                            CFNumberRef wide = CFDictionaryGetValue(info, CFSTR("Wide"));
-                            CFNumberRef high = CFDictionaryGetValue(info, CFSTR("High"));
-                            if (wide && high &&
-                                CFNumberGetValue(wide, kCFNumberSInt32Type, &pw) &&
-                                CFNumberGetValue(high, kCFNumberSInt32Type, &ph) &&
-                                pw > 0 && ph > 0) {
-                                goto found;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-found:
-        if (plist) CFRelease(plist);
-        CFReadStreamClose(stream);
-    }
-    if (stream) CFRelease(stream);
-    if (url) CFRelease(url);
+    int display_count = get_display_count();
+    if (display_count < 1) display_count = 1;
     uint32_t refresh_rate = get_display_refresh_rate();
 
-    /* Native mode */
-    drmModeModeInfo *m = &g_modes[g_mode_count++];
-    memset(m, 0, sizeof(*m));
-    m->clock       = (pw * ph * refresh_rate + 500) / 1000;
-    m->hdisplay    = pw;  m->hsync_start = pw + 88;
-    m->hsync_end   = pw + 88 + 44;  m->htotal = pw + 88 + 44 + 168;
-    m->vdisplay    = ph;  m->vsync_start = ph + 4;
-    m->vsync_end   = ph + 4 + 5;   m->vtotal = ph + 4 + 5 + 36;
-    m->vrefresh    = refresh_rate;
-    m->type        = 0;
-    snprintf(m->name, sizeof(m->name), "%ux%u", pw, ph);
-
-    /* 1920x1080 fallback */
-    m = &g_modes[g_mode_count++];
-    memset(m, 0, sizeof(*m));
-    m->clock       = (1920 * 1080 * refresh_rate + 500) / 1000;
-    m->hdisplay    = 1920; m->hsync_start = 2008;
-    m->hsync_end   = 2052; m->htotal = 2200;
-    m->vdisplay    = 1080; m->vsync_start = 1084;
-    m->vsync_end   = 1089; m->vtotal = 1125;
-    m->vrefresh    = refresh_rate;
-    m->type        = 0;
-    snprintf(m->name, sizeof(m->name), "1920x1080");
+    for (int d = 0; d < display_count && g_mode_count < (int)(sizeof(g_modes)/sizeof(g_modes[0])) - 1; d++) {
+        uint32_t pw, ph;
+        int dx, dy;
+        get_display_bounds(d, &pw, &ph, &dx, &dy);
+        drmModeModeInfo *m = &g_modes[g_mode_count++];
+        memset(m, 0, sizeof(*m));
+        m->clock       = (pw * ph * refresh_rate + 500) / 1000;
+        m->hdisplay    = pw;  m->hsync_start = pw + 88;
+        m->hsync_end   = pw + 88 + 44;  m->htotal = pw + 88 + 44 + 168;
+        m->vdisplay    = ph;  m->vsync_start = ph + 4;
+        m->vsync_end   = ph + 4 + 5;   m->vtotal = ph + 4 + 5 + 36;
+        m->vrefresh    = refresh_rate;
+        m->type        = 0;
+        snprintf(m->name, sizeof(m->name), "%ux%u", pw, ph);
+    }
+    // 1920x1080 fallback if we have room
+    if (g_mode_count < (int)(sizeof(g_modes)/sizeof(g_modes[0]))) {
+        drmModeModeInfo *m = &g_modes[g_mode_count++];
+        memset(m, 0, sizeof(*m));
+        m->clock       = (1920 * 1080 * refresh_rate + 500) / 1000;
+        m->hdisplay    = 1920; m->hsync_start = 2008;
+        m->hsync_end   = 2052; m->htotal = 2200;
+        m->vdisplay    = 1080; m->vsync_start = 1084;
+        m->vsync_end   = 1089; m->vtotal = 1125;
+        m->vrefresh    = refresh_rate;
+        m->type        = 0;
+        snprintf(m->name, sizeof(m->name), "1920x1080");
+    }
 }
 #define G_MODE_COUNT  g_mode_count
+#define MAX_CRTCS 8
 
-/* active CRTC state */
+/* active CRTC state per CRTC (multi-monitor) */
 static struct {
     uint32_t        crtc_fb_id;
     drmModeModeInfo crtc_mode;
     int             crtc_mode_valid;
-} g_state;
+    int             x, y;
+} g_state[MAX_CRTCS];
+
+static int get_display_count(void) {
+    ensure_displays();
+    int n = g_display_count;
+    if (n < 1) n = 1;
+    if (n > MAX_CRTCS) n = MAX_CRTCS;
+    return n;
+}
+
+static void get_display_bounds(int idx, uint32_t *w, uint32_t *h, int *x, int *y) {
+    ensure_displays();
+    if (idx < 0 || idx >= g_display_count) {
+        *w = 1920; *h = 1080; *x = 0; *y = 0;
+        return;
+    }
+    CGRect b = CGDisplayBounds(g_displays[idx]);
+    /* Report PIXEL resolution (points * scale) so the framebuffer Weston
+     * allocates matches the SDL window's high-density drawable 1:1. */
+    *w = (uint32_t)CGDisplayPixelsWide(g_displays[idx]);
+    *h = (uint32_t)CGDisplayPixelsHigh(g_displays[idx]);
+    *x = (int)b.origin.x;
+    *y = (int)b.origin.y;
+}
+
+/* Virtual planes: one primary plane per CRTC so every output can enable.
+ * Plane id N maps 1:1 to CRTC id N (see atomic FB_ID handling below). */
+static uint32_t *g_plane_ids = NULL;
+static int g_plane_count = 0;
+
+static void ensure_planes(void) {
+    if (g_plane_ids) return;
+    int n = get_display_count();
+    if (n < 1) n = 1;
+    if (n > MAX_CRTCS) n = MAX_CRTCS;
+    g_plane_ids = malloc(n * sizeof(uint32_t));
+    for (int i = 0; i < n; i++) g_plane_ids[i] = (uint32_t)(i + 1);
+    g_plane_count = n;
+}
 
 /* DRM event pipe — written by drmModePageFlip, read by drmHandleEvent.
  * wayland-mac.c dup2's a real pipe to fd DRM_VIRTUAL_FD at startup so
  * select/poll work natively on the virtual fd.  -1 = not initialised. */
 int g_drm_event_pipe_write = -1;
 
-/* Pending page-flip user_data — drmModePageFlip stores it, drmHandleEvent
- * passes it to the event handler.  Only one outstanding flip at a time. */
-static void *g_pending_flip_data = NULL;
+/* Pending page-flip events. Each drmModePageFlip enqueues one; drmHandleEvent
+ * dequeues and reports it with the correct CRTC id so Weston re-arms the right
+ * output's repaint loop (critical for multi-monitor: a single global would only
+ * ever re-arm CRTC 1, leaving every other output stuck on its first frame). */
+typedef struct { uint32_t crtc_id; void *data; } flip_event_t;
+#define MAX_FLIP_EVENTS 64
+static flip_event_t g_flip_events[MAX_FLIP_EVENTS];
+static int g_flip_ev_head = 0;
+static int g_flip_ev_tail = 0;
+static pthread_mutex_t g_flip_ev_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void enqueue_flip_event(uint32_t crtc_id, void *data) {
+    pthread_mutex_lock(&g_flip_ev_lock);
+    int next = (g_flip_ev_head + 1) % MAX_FLIP_EVENTS;
+    if (next == g_flip_ev_tail) {
+        /* queue full: drop oldest */
+        g_flip_ev_tail = (g_flip_ev_tail + 1) % MAX_FLIP_EVENTS;
+    }
+    g_flip_events[g_flip_ev_head].crtc_id = crtc_id;
+    g_flip_events[g_flip_ev_head].data = data;
+    g_flip_ev_head = next;
+    pthread_mutex_unlock(&g_flip_ev_lock);
+}
+
+static int dequeue_flip_event(uint32_t *crtc_id, void **data) {
+    pthread_mutex_lock(&g_flip_ev_lock);
+    if (g_flip_ev_head == g_flip_ev_tail) {
+        pthread_mutex_unlock(&g_flip_ev_lock);
+        return 0;
+    }
+    *crtc_id = g_flip_events[g_flip_ev_tail].crtc_id;
+    *data = g_flip_events[g_flip_ev_tail].data;
+    g_flip_ev_tail = (g_flip_ev_tail + 1) % MAX_FLIP_EVENTS;
+    pthread_mutex_unlock(&g_flip_ev_lock);
+    return 1;
+}
 
 /* ── helpers ──────────────────────────────────────────────────────────── */
 
@@ -195,20 +281,24 @@ drmModeResPtr drmModeGetResources(int fd)
     drmModeRes *r = calloc(1, sizeof(*r));
     if (!r) return NULL;
 
+    int n = get_display_count();
+    if (n < 1) n = 1;
+    if (n > MAX_CRTCS) n = MAX_CRTCS;
+
     r->count_fbs        = 0;
     r->fbs              = NULL;
 
-    r->count_crtcs      = 1;
-    r->crtcs            = malloc(sizeof(uint32_t));
-    r->crtcs[0]         = 1;
+    r->count_crtcs      = n;
+    r->crtcs            = malloc(n * sizeof(uint32_t));
+    for (int i = 0; i < n; i++) r->crtcs[i] = i + 1;
 
-    r->count_connectors = 1;
-    r->connectors       = malloc(sizeof(uint32_t));
-    r->connectors[0]    = 1;
+    r->count_connectors = n;
+    r->connectors       = malloc(n * sizeof(uint32_t));
+    for (int i = 0; i < n; i++) r->connectors[i] = i + 1;
 
-    r->count_encoders   = 1;
-    r->encoders         = malloc(sizeof(uint32_t));
-    r->encoders[0]      = 1;
+    r->count_encoders   = n;
+    r->encoders         = malloc(n * sizeof(uint32_t));
+    for (int i = 0; i < n; i++) r->encoders[i] = i + 1;
 
     r->min_width  = 1;    r->max_width  = 8192;
     r->min_height = 1;    r->max_height = 8192;
@@ -231,24 +321,42 @@ void drmModeFreeResources(drmModeResPtr ptr)
 drmModeConnectorPtr drmModeGetConnector(int fd, uint32_t connector_id)
 {
     if (check_fd(fd) < 0) return NULL;
-    if (connector_id != 1) { errno = ENOENT; return NULL; }
+    int n = get_display_count();
+    if (connector_id < 1 || connector_id > (uint32_t)n) { errno = ENOENT; return NULL; }
 
     drmModeConnector *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
 
-    c->connector_id      = 1;
-    c->encoder_id        = 1;
+    c->connector_id      = connector_id;
+    c->encoder_id        = connector_id;
     c->connector_type    = DRM_MODE_CONNECTOR_DisplayPort;
-    c->connector_type_id = 1;
+    c->connector_type_id = connector_id;
     c->connection        = DRM_MODE_CONNECTED;
     c->mmWidth           = 527;
     c->mmHeight          = 296;
     c->subpixel          = 0;
 
     init_modes();
+    // For per-connector, return the mode matching that display's size as first mode
+    // plus all modes as fallback
+    int idx = (int)connector_id - 1;
+    uint32_t pw, ph; int dx, dy;
+    get_display_bounds(idx, &pw, &ph, &dx, &dy);
+    // Find mode matching this display's size as first
     c->count_modes       = G_MODE_COUNT;
     c->modes             = malloc(G_MODE_COUNT * sizeof(drmModeModeInfo));
-    memcpy(c->modes, g_modes, G_MODE_COUNT * sizeof(drmModeModeInfo));
+    // Put matching mode first if found
+    int found = -1;
+    for (int i = 0; i < G_MODE_COUNT; i++) {
+        if (g_modes[i].hdisplay == pw && g_modes[i].vdisplay == ph) { found = i; break; }
+    }
+    if (found >= 0 && found != 0) {
+        c->modes[0] = g_modes[found];
+        int out = 1;
+        for (int i = 0; i < G_MODE_COUNT; i++) if (i != found) c->modes[out++] = g_modes[i];
+    } else {
+        memcpy(c->modes, g_modes, G_MODE_COUNT * sizeof(drmModeModeInfo));
+    }
 
     c->count_props       = 0;
     c->props             = NULL;
@@ -256,7 +364,7 @@ drmModeConnectorPtr drmModeGetConnector(int fd, uint32_t connector_id)
 
     c->count_encoders    = 1;
     c->encoders          = malloc(sizeof(uint32_t));
-    c->encoders[0]       = 1;
+    c->encoders[0]       = connector_id;
 
     return c;
 }
@@ -276,15 +384,16 @@ void drmModeFreeConnector(drmModeConnectorPtr ptr)
 drmModeEncoderPtr drmModeGetEncoder(int fd, uint32_t encoder_id)
 {
     if (check_fd(fd) < 0) return NULL;
-    if (encoder_id != 1) { errno = ENOENT; return NULL; }
+    int n = get_display_count();
+    if (encoder_id < 1 || encoder_id > (uint32_t)n) { errno = ENOENT; return NULL; }
 
     drmModeEncoder *e = calloc(1, sizeof(*e));
     if (!e) return NULL;
 
-    e->encoder_id     = 1;
+    e->encoder_id     = encoder_id;
     e->encoder_type   = 10;
-    e->crtc_id        = 1;
-    e->possible_crtcs = 1;    /* bit 0 = CRTC pipe 0 */
+    e->crtc_id        = encoder_id;
+    e->possible_crtcs = 1u << (encoder_id - 1);
     e->possible_clones= 0x0;
 
     return e;
@@ -300,19 +409,22 @@ void drmModeFreeEncoder(drmModeEncoderPtr ptr)
 drmModeCrtcPtr drmModeGetCrtc(int fd, uint32_t crtc_id)
 {
     if (check_fd(fd) < 0) return NULL;
-    if (crtc_id != 1) { errno = ENOENT; return NULL; }
+    int n = get_display_count();
+    if (crtc_id < 1 || crtc_id > (uint32_t)n) { errno = ENOENT; return NULL; }
 
     drmModeCrtc *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
 
-    c->crtc_id    = 1;
-    c->buffer_id  = g_state.crtc_fb_id;
-    c->x = c->y  = 0;
-    c->width      = g_state.crtc_mode_valid ? g_state.crtc_mode.hdisplay : 0;
-    c->height     = g_state.crtc_mode_valid ? g_state.crtc_mode.vdisplay : 0;
-    c->mode_valid = g_state.crtc_mode_valid;
-    if (g_state.crtc_mode_valid)
-        c->mode = g_state.crtc_mode;
+    int idx = (int)crtc_id - 1;
+    c->crtc_id    = crtc_id;
+    c->buffer_id  = g_state[idx].crtc_fb_id;
+    c->x = g_state[idx].x;
+    c->y = g_state[idx].y;
+    c->width      = g_state[idx].crtc_mode_valid ? g_state[idx].crtc_mode.hdisplay : 0;
+    c->height     = g_state[idx].crtc_mode_valid ? g_state[idx].crtc_mode.vdisplay : 0;
+    c->mode_valid = g_state[idx].crtc_mode_valid;
+    if (g_state[idx].crtc_mode_valid)
+        c->mode = g_state[idx].crtc_mode;
     c->gamma_size = 256;
 
     return c;
@@ -575,14 +687,24 @@ int drmModeSetCrtc(int fd, uint32_t crtc_id, uint32_t fb_id,
                    drmModeModeInfo *mode)
 {
     if (check_fd(fd) < 0) return -1;
-    if (crtc_id != 1) { errno = ENOENT; return -1; }
-    (void)x; (void)y; (void)connectors; (void)count;
+    int n = get_display_count();
+    if (crtc_id < 1 || crtc_id > (uint32_t)n) { errno = ENOENT; return -1; }
+    (void)connectors; (void)count;
 
-    g_state.crtc_fb_id      = fb_id;
-    g_state.crtc_mode_valid = (mode != NULL);
-    if (mode) g_state.crtc_mode = *mode;
+    int idx = (int)crtc_id - 1;
+    g_state[idx].crtc_fb_id      = fb_id;
+    g_state[idx].x = (int)x;
+    g_state[idx].y = (int)y;
+    g_state[idx].crtc_mode_valid = (mode != NULL);
+    if (mode) g_state[idx].crtc_mode = *mode;
 
-    /* SetCrtc just records state — the actual surface is sent on page flip */
+    // If a framebuffer is provided, present it immediately at the given position
+    if (fb_id != 0) {
+        IOSurfaceRef surf = fb_id_to_surface(fb_id);
+        if (surf) {
+            sdl_present_iosurface_for_crtc(surf, crtc_id, (int)x, (int)y);
+        }
+    }
     return 0;
 }
 
@@ -590,30 +712,25 @@ int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id,
                     uint32_t flags, void *user_data)
 {
     if (check_fd(fd) < 0) return -1;
-    if (crtc_id != 1) { errno = ENOENT; return -1; }
+    int n = get_display_count();
+    if (crtc_id < 1 || crtc_id > (uint32_t)n) { errno = ENOENT; return -1; }
 
-    g_state.crtc_fb_id = fb_id;
+    int idx = (int)crtc_id - 1;
+    g_state[idx].crtc_fb_id = fb_id;
 
     IOSurfaceRef surf = fb_id_to_surface(fb_id);
-    mach_port_t surface_port = MACH_PORT_NULL;
     if (surf) {
-        surface_port = IOSurfaceCreateMachPort(surf);
+        int x = g_state[idx].x;
+        int y = g_state[idx].y;
+        sdl_present_iosurface_for_crtc(surf, crtc_id, x, y);
     }
 
-    char buf[256];
-    snprintf(buf, sizeof(buf),
-             "{\"op\":\"page_flip\",\"crtc\":%u,\"fb\":%u,\"flags\":%u}",
-             crtc_id, fb_id, flags);
+    int ret = 0;
 
-    g_pending_flip_data = user_data;
-
-    int ret = drm_send_json_with_surface(buf, surface_port);
-
-    if (surface_port != MACH_PORT_NULL)
-        mach_port_deallocate(mach_task_self(), surface_port);
-
-    /* Signal page flip completion immediately (TODO: real vsync) */
+    /* Signal page flip completion. Store the CRTC id so Weston re-arms the
+     * correct output's repaint loop (essential for multi-monitor). */
     if (ret == 0 && g_drm_event_pipe_write >= 0) {
+        enqueue_flip_event(crtc_id, user_data);
         char byte = 1;
         ssize_t w = write(g_drm_event_pipe_write, &byte, 1);
         (void)w;
@@ -635,22 +752,27 @@ int drmHandleEvent(int fd, drmEventContextPtr evctx)
     }
 
     if (byte == 1 && evctx) {
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        void *data = g_pending_flip_data;
-        g_pending_flip_data = NULL;
-        /* page_flip_handler2 (v2+) provides CRTC ID required for atomic mode */
-        if (evctx->version >= 2 && evctx->page_flip_handler2) {
-            evctx->page_flip_handler2(fd, 0,
-                                      (unsigned int)tv.tv_sec,
-                                      (unsigned int)tv.tv_usec,
-                                      1 /* crtc_id */,
-                                      data);
-        } else if (evctx->page_flip_handler) {
-            evctx->page_flip_handler(fd, 0,
-                                      (unsigned int)tv.tv_sec,
-                                      (unsigned int)tv.tv_usec,
-                                      data);
+        /* Drain all queued flip events for this wakeup (a single commit may
+         * have enqueued completions for multiple CRTCs). */
+        for (;;) {
+            uint32_t crtc_id = 1;
+            void *data = NULL;
+            if (!dequeue_flip_event(&crtc_id, &data)) break;
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            /* page_flip_handler2 (v2+) provides CRTC ID required for atomic mode */
+            if (evctx->version >= 2 && evctx->page_flip_handler2) {
+                evctx->page_flip_handler2(fd, 0,
+                                          (unsigned int)tv.tv_sec,
+                                          (unsigned int)tv.tv_usec,
+                                          crtc_id,
+                                          data);
+            } else if (evctx->page_flip_handler) {
+                evctx->page_flip_handler(fd, 0,
+                                          (unsigned int)tv.tv_sec,
+                                          (unsigned int)tv.tv_usec,
+                                          data);
+            }
         }
     }
     return 1;
@@ -985,50 +1107,41 @@ static void ensure_obj_properties(void)
 {
     ensure_cached_prop_ids();
 
-    /* CRTC 1: default ACTIVE=1 */
-    obj_props_t *cr = get_obj_props(1, DRM_MODE_OBJECT_CRTC);
-    if (cr->prop_count == 0) {
-        set_obj_prop(cr, g_cached_prop_ids.active, 1);
-        set_obj_prop(cr, g_cached_prop_ids.mode_id, 0);
+    /* CRTCs 1..N: default ACTIVE=1, MODE_ID=0 */
+    int n = get_display_count();
+    if (n < 1) n = 1;
+    if (n > MAX_CRTCS) n = MAX_CRTCS;
+    for (int i = 0; i < n; i++) {
+        obj_props_t *cr = get_obj_props((uint32_t)(i + 1), DRM_MODE_OBJECT_CRTC);
+        if (cr->prop_count == 0) {
+            set_obj_prop(cr, g_cached_prop_ids.active, 1);
+            set_obj_prop(cr, g_cached_prop_ids.mode_id, 0);
+        }
+        obj_props_t *co = get_obj_props((uint32_t)(i + 1), DRM_MODE_OBJECT_CONNECTOR);
+        if (co->prop_count == 0) {
+            set_obj_prop(co, g_cached_prop_ids.dpms, 0);
+            set_obj_prop(co, g_cached_prop_ids.crtc_id, 0);
+        }
     }
 
-    /* Connector 1: default DPMS=0, CRTC_ID=0 */
-    obj_props_t *co = get_obj_props(1, DRM_MODE_OBJECT_CONNECTOR);
-    if (co->prop_count == 0) {
-        set_obj_prop(co, g_cached_prop_ids.dpms, 0);
-        set_obj_prop(co, g_cached_prop_ids.crtc_id, 0);
-    }
-
-    /* Primary plane (1) */
-    obj_props_t *pp = get_obj_props(1, DRM_MODE_OBJECT_PLANE);
-    if (pp->prop_count == 0) {
-        set_obj_prop(pp, g_cached_prop_ids.type, DRM_PLANE_TYPE_PRIMARY);
-        set_obj_prop(pp, g_cached_prop_ids.fb_id, 0);
-        set_obj_prop(pp, g_cached_prop_ids.crtc_id, 0);
-        set_obj_prop(pp, g_cached_prop_ids.crtc_x, 0);
-        set_obj_prop(pp, g_cached_prop_ids.crtc_y, 0);
-        set_obj_prop(pp, g_cached_prop_ids.crtc_w, 0);
-        set_obj_prop(pp, g_cached_prop_ids.crtc_h, 0);
-        set_obj_prop(pp, g_cached_prop_ids.src_x, 0);
-        set_obj_prop(pp, g_cached_prop_ids.src_y, 0);
-        set_obj_prop(pp, g_cached_prop_ids.src_w, 0);
-        set_obj_prop(pp, g_cached_prop_ids.src_h, 0);
-    }
-
-    /* Cursor plane (2) */
-    obj_props_t *cp = get_obj_props(2, DRM_MODE_OBJECT_PLANE);
-    if (cp->prop_count == 0) {
-        set_obj_prop(cp, g_cached_prop_ids.type, DRM_PLANE_TYPE_CURSOR);
-        set_obj_prop(cp, g_cached_prop_ids.fb_id, 0);
-        set_obj_prop(cp, g_cached_prop_ids.crtc_id, 0);
-        set_obj_prop(cp, g_cached_prop_ids.crtc_x, 0);
-        set_obj_prop(cp, g_cached_prop_ids.crtc_y, 0);
-        set_obj_prop(cp, g_cached_prop_ids.crtc_w, 64);
-        set_obj_prop(cp, g_cached_prop_ids.crtc_h, 64);
-        set_obj_prop(cp, g_cached_prop_ids.src_x, 0);
-        set_obj_prop(cp, g_cached_prop_ids.src_y, 0);
-        set_obj_prop(cp, g_cached_prop_ids.src_w, 64);
-        set_obj_prop(cp, g_cached_prop_ids.src_h, 64);
+    /* One primary plane per CRTC (1:1). All are PRIMARY type. */
+    ensure_planes();
+    for (int i = 0; i < g_plane_count; i++) {
+        uint32_t pid = (uint32_t)(i + 1);
+        obj_props_t *pp = get_obj_props(pid, DRM_MODE_OBJECT_PLANE);
+        if (pp->prop_count == 0) {
+            set_obj_prop(pp, g_cached_prop_ids.type, DRM_PLANE_TYPE_PRIMARY);
+            set_obj_prop(pp, g_cached_prop_ids.fb_id, 0);
+            set_obj_prop(pp, g_cached_prop_ids.crtc_id, pid);
+            set_obj_prop(pp, g_cached_prop_ids.crtc_x, 0);
+            set_obj_prop(pp, g_cached_prop_ids.crtc_y, 0);
+            set_obj_prop(pp, g_cached_prop_ids.crtc_w, 0);
+            set_obj_prop(pp, g_cached_prop_ids.crtc_h, 0);
+            set_obj_prop(pp, g_cached_prop_ids.src_x, 0);
+            set_obj_prop(pp, g_cached_prop_ids.src_y, 0);
+            set_obj_prop(pp, g_cached_prop_ids.src_w, 0);
+            set_obj_prop(pp, g_cached_prop_ids.src_h, 0);
+        }
     }
 }
 
@@ -1203,10 +1316,6 @@ int drmModeDestroyPropertyBlob(int fd, uint32_t blob_id)
 
 /* ── plane resources ─────────────────────────────────────────────────── */
 
-/* Virtual planes: only primary plane (1) to force software cursor fallback */
-static const uint32_t g_plane_ids[] = { 1 };
-#define G_PLANE_COUNT  ((int)(sizeof(g_plane_ids)/sizeof(g_plane_ids[0])))
-
 /* default supported formats per plane */
 static uint32_t g_primary_formats[] = { DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888 };
 static uint32_t g_cursor_formats[]  = { DRM_FORMAT_ARGB8888 };
@@ -1220,12 +1329,14 @@ drmModePlaneResPtr drmModeGetPlaneResources(int fd)
         return NULL;
     }
 
+    ensure_planes();
+
     drmModePlaneRes *r = calloc(1, sizeof(*r));
     if (!r) return NULL;
-    r->count_planes = G_PLANE_COUNT;
-    r->planes = malloc(G_PLANE_COUNT * sizeof(uint32_t));
+    r->count_planes = g_plane_count;
+    r->planes = malloc(g_plane_count * sizeof(uint32_t));
     if (r->planes) memcpy(r->planes, g_plane_ids,
-                          G_PLANE_COUNT * sizeof(uint32_t));
+                          g_plane_count * sizeof(uint32_t));
     return r;
 }
 
@@ -1241,38 +1352,31 @@ drmModePlanePtr drmModeGetPlane(int fd, uint32_t plane_id)
     if (check_fd(fd) < 0) return NULL;
     ensure_obj_properties();
     ensure_cached_prop_ids();
+    ensure_planes();
 
     drmModePlane *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
 
     p->plane_id = plane_id;
-    p->possible_crtcs = 1;   /* bit 0 = CRTC pipe 0 (our only CRTC) */
+    /* Plane N is bound to CRTC N only, keeping the 1:1 present mapping. */
+    p->possible_crtcs = (plane_id >= 1 && plane_id <= (uint32_t)g_plane_count)
+                            ? (1u << (plane_id - 1))
+                            : 1u;
     p->gamma_size = 256;
-    p->crtc_id    = 1;
+    p->crtc_id    = plane_id;
     p->fb_id      = (uint32_t)get_obj_prop(
                         get_obj_props(plane_id, DRM_MODE_OBJECT_PLANE),
                         g_cached_prop_ids.fb_id);
 
-    switch (plane_id) {
-    case 1: /* primary */
+    /* Every virtual plane is a primary plane (1:1 with a CRTC). Cursor uses
+     * the Weston software fallback, so we don't expose separate cursor planes. */
+    if (plane_id >= 1 && plane_id <= (uint32_t)g_plane_count) {
         p->count_formats = 2;
         p->formats = malloc(2 * sizeof(uint32_t));
         if (p->formats) { p->formats[0] = DRM_FORMAT_XRGB8888;
                            p->formats[1] = DRM_FORMAT_ARGB8888; }
         p->format_modifiers = NULL;
-        break;
-    case 2: /* cursor */
-        p->count_formats = 1;
-        p->formats = malloc(1 * sizeof(uint32_t));
-        if (p->formats) p->formats[0] = DRM_FORMAT_ARGB8888;
-        break;
-    case 3: /* overlay */
-        p->count_formats = 2;
-        p->formats = malloc(2 * sizeof(uint32_t));
-        if (p->formats) { p->formats[0] = DRM_FORMAT_XRGB8888;
-                           p->formats[1] = DRM_FORMAT_ARGB8888; }
-        break;
-    default:
+    } else {
         free(p->formats);
         free(p);
         errno = ENOENT;
@@ -1339,6 +1443,11 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReq *req,
     /* Apply all property changes */
     uint32_t new_fb_id = 0;
     uint32_t new_plane_id = 0;
+    /* A single atomic commit can flip multiple CRTCs at once (e.g. the
+     * initial combined modeset).  Track every CRTC that actually flips so
+     * each output's repaint loop is re-armed (essential for multi-monitor). */
+    uint32_t flip_crtcs[8];
+    int flip_n = 0;
 
     for (int i = 0; i < req->prop_count; i++) {
         uint32_t obj_id  = req->obj_ids[i];
@@ -1355,56 +1464,82 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReq *req,
 
         set_obj_prop(op, prop_id, val);
 
-        /* Track/send FB_ID changes */
+        /* Track/send FB_ID changes - multi-monitor: map plane to CRTC */
         if (prop_id == g_cached_prop_ids.fb_id) {
-            bool is_cursor = (obj_id == 2);
+            // Every virtual plane is a primary plane (no cursor planes are
+            // exposed), so never skip. Primary plane N maps to CRTC N.
+            // Determine CRTC for this plane: primary planes 1..N map to CRTC 1..N
+            uint32_t crtc_id = obj_id;
+            // For overlay planes, try to find crtc_id via plane's CRTC_ID property
+            if (crtc_id > (uint32_t)get_display_count()) {
+                // Fallback: try to get CRTC_ID from plane's obj_props
+                obj_props_t *plane_props = op;
+                uint64_t crtc_val = 0;
+                for (int k = 0; k < plane_props->prop_count; k++) {
+                    if (plane_props->prop_ids[k] == g_cached_prop_ids.crtc_id) {
+                        crtc_val = plane_props->prop_vals[k];
+                        break;
+                    }
+                }
+                if (crtc_val > 0) crtc_id = (uint32_t)crtc_val;
+                else crtc_id = 1;
+            }
+            int crtc_idx = (int)crtc_id - 1;
+            if (crtc_idx < 0 || crtc_idx >= MAX_CRTCS) crtc_idx = 0;
             IOSurfaceRef surf = fb_id_to_surface((uint32_t)val);
             if (surf) {
-                mach_port_t surface_port = IOSurfaceCreateMachPort(surf);
-                char buf[256];
-                if (is_cursor) {
-                    snprintf(buf, sizeof(buf),
-                             "{\"op\":\"cursor_set\",\"crtc\":1,\"w\":64,\"h\":64}");
-                } else {
-                    snprintf(buf, sizeof(buf),
-                             "{\"op\":\"page_flip\",\"crtc\":1,\"fb\":%u,\"flags\":%u}",
-                             (uint32_t)val, flags);
-                    g_state.crtc_fb_id = (uint32_t)val;
+                // Get plane's CRTC_X/Y for positioning (multi-monitor offset)
+                int x = g_state[crtc_idx].x;
+                int y = g_state[crtc_idx].y;
+                // Try to get from plane's props if set in this atomic batch
+                for (int k = 0; k < op->prop_count; k++) {
+                    if (op->prop_ids[k] == g_cached_prop_ids.crtc_x) x = (int)op->prop_vals[k];
+                    if (op->prop_ids[k] == g_cached_prop_ids.crtc_y) y = (int)op->prop_vals[k];
                 }
-                drm_send_json_with_surface(buf, surface_port);
-                if (surface_port != MACH_PORT_NULL)
-                    mach_port_deallocate(mach_task_self(), surface_port);
+                sdl_present_iosurface_for_crtc(surf, crtc_id, x, y);
+                g_state[crtc_idx].crtc_fb_id = (uint32_t)val;
             }
-            if (!is_cursor)
-                new_fb_id = (uint32_t)val;
+            new_fb_id = (uint32_t)val;
+            new_plane_id = obj_id;
+            if (flip_n < 8) {
+                int seen = 0;
+                for (int f = 0; f < flip_n; f++)
+                    if (flip_crtcs[f] == crtc_id) { seen = 1; break; }
+                if (!seen) flip_crtcs[flip_n++] = crtc_id;
+            }
+        }
+        // Track CRTC_X/Y changes for planes to update g_state position
+        if (prop_id == g_cached_prop_ids.crtc_x || prop_id == g_cached_prop_ids.crtc_y) {
+            // Find which CRTC this plane belongs to
+            uint32_t crtc_id = obj_id;
+            if (crtc_id > (uint32_t)get_display_count()) continue;
+            int idx = (int)crtc_id - 1;
+            if (prop_id == g_cached_prop_ids.crtc_x) g_state[idx].x = (int)val;
+            if (prop_id == g_cached_prop_ids.crtc_y) g_state[idx].y = (int)val;
         }
     }
 
     /* Send page flip event for primary plane if detected */
     if (new_fb_id > 0) {
-        g_state.crtc_fb_id = new_fb_id;
-    }
-
-    /* Forward cursor plane position changes to framebufferd */
-    if (cursor_props) {
-        static int prev_cx = 0, prev_cy = 0;
-        uint64_t cx = get_obj_prop(cursor_props, g_cached_prop_ids.crtc_x);
-        uint64_t cy = get_obj_prop(cursor_props, g_cached_prop_ids.crtc_y);
-        uint64_t fb = get_obj_prop(cursor_props, g_cached_prop_ids.fb_id);
-        if (fb > 0 && ((int)cx != prev_cx || (int)cy != prev_cy)) {
-            prev_cx = (int)cx;
-            prev_cy = (int)cy;
-            char buf[128];
-            snprintf(buf, sizeof(buf),
-                     "{\"op\":\"cursor_move\",\"crtc\":1,\"x\":%d,\"y\":%d}",
-                     prev_cx, prev_cy);
-            drm_send_json(buf);
+        // Update g_state for the plane that had FB change (use new_plane_id mapping)
+        int idx = (int)new_plane_id - 1;
+        if (idx >= 0 && idx < MAX_CRTCS) {
+            g_state[idx].crtc_fb_id = new_fb_id;
+        } else {
+            g_state[0].crtc_fb_id = new_fb_id;
         }
     }
 
-    /* Signal page flip completion when PAGE_FLIP_EVENT is requested */
+    /* Cursor plane position changes are ignored in SDL mode (software cursor) */
+
+    /* Signal page flip completion when PAGE_FLIP_EVENT is requested.
+     * Use the CRTC id captured from the FB_ID change so the correct output's
+     * repaint loop is re-armed (multi-monitor). */
     if (flags & DRM_MODE_PAGE_FLIP_EVENT) {
-        g_pending_flip_data = user_data;
+        if (flip_n == 0) flip_crtcs[flip_n++] = 1;
+        for (int f = 0; f < flip_n; f++) {
+            enqueue_flip_event(flip_crtcs[f], user_data);
+        }
         if (g_drm_event_pipe_write >= 0) {
             char byte = 1;
             ssize_t w = write(g_drm_event_pipe_write, &byte, 1);

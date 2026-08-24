@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Run weston with terminal on macOS via our DRM/GBM/EGL shims.
+# Run weston with SDL window on macOS via DRM/GBM/EGL shims (single-library mode, no daemons).
 #
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -15,32 +15,42 @@ WESTON_MODULE_MAP="${WESTON_MODULE_MAP};weston-keyboard=${BUILD_DIR}/clients/wes
 WESTON_MODULE_MAP="${WESTON_MODULE_MAP};weston-desktop-shell=${BUILD_DIR}/clients/weston-desktop-shell"
 WESTON_MODULE_MAP="${WESTON_MODULE_MAP};weston-terminal=${BUILD_DIR}/clients/weston-terminal"
 
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/weston-runtime}"
-mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/weston-runtime-$(id -u)}"
+mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || sudo mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null
+# Clean up old root-owned runtime dir if it exists
+if [ -d /tmp/weston-runtime ]; then
+  sudo rm -rf /tmp/weston-runtime 2>/dev/null || rm -rf /tmp/weston-runtime 2>/dev/null
+fi
 
 # Kill stale processes
 echo "=== Cleaning up ==="
-sudo pkill -9 weston 2>/dev/null; sudo pkill -9 framebufferd 2>/dev/null
-sudo pkill -9 amfiexceptiond 2>/dev/null
-sudo rm -f "$XDG_RUNTIME_DIR"/wayland-*
+pkill -9 weston 2>/dev/null; sudo pkill -9 weston 2>/dev/null || true
+pkill -9 framebufferd 2>/dev/null; sudo pkill -9 framebufferd 2>/dev/null || true
+pkill -9 inputd 2>/dev/null; sudo pkill -9 inputd 2>/dev/null || true
+pkill -9 amfiexceptiond 2>/dev/null; sudo pkill -9 amfiexceptiond 2>/dev/null || true
+# Also kill any stale SDL weston
+sudo rm -rf /tmp/libwayland-support 2>/dev/null || true
+rm -f "$XDG_RUNTIME_DIR"/wayland-*
 
 # Generate weston.ini from template
-sudo rm -f /tmp/weston-*.ini
-TEMP_WESTON_INI=$(mktemp /tmp/weston-XXXXXX.ini)
+rm -f /tmp/weston-*.ini 2>/dev/null; sudo rm -f /tmp/weston-*.ini 2>/dev/null || true
+rm -f /tmp/weston.XXXXXX 2>/dev/null || true
+TEMP_WESTON_INI=$(mktemp /tmp/weston.XXXXXX 2>/dev/null || mktemp -t weston)
+TEMP_WESTON_INI="${TEMP_WESTON_INI}.ini"
 sed "s|%SourceDirectory%|$SCRIPT_DIR|g" "$SCRIPT_DIR/weston.ini" > "$TEMP_WESTON_INI"
 
-# Start weston
-echo "=== Starting weston ==="
-sudo env \
+# Start weston (no sudo required in SDL single-library mode)
+echo "=== Starting weston (SDL single-library) ==="
+env \
     DYLD_INSERT_LIBRARIES="$DYLD_INSERT_LIBRARIES" \
     WESTON_MODULE_MAP="$WESTON_MODULE_MAP" \
     XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
     WESTON_DATA_DIR="$WESTON_DATA_DIR" \
+    SDL_VIDEODRIVER=cocoa \
     "$BUILD_DIR/frontend/weston" --backend=drm \
     --continue-without-input \
     --config="$TEMP_WESTON_INI" &
-
 WESTON_PID=$!
 
 # Wait for wayland socket

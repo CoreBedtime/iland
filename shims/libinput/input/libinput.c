@@ -6,8 +6,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <mach/mach.h>
-#include <bootstrap.h>
 #include <libudev.h>
 #include <libinput.h>
 #include <input_ipc.h>
@@ -89,10 +87,7 @@ static struct {
     struct libinput_event *ev_head;
     struct libinput_event *ev_tail;
     pthread_mutex_t       ev_lock;
-    mach_port_t           inputd_port;
-    mach_port_t           recv_port;
     int                   pipe_r, pipe_w;
-    pthread_t             recv_thread;
     volatile bool         running;
     bool                  connected;
     int                   pressed_keys;
@@ -103,169 +98,134 @@ static struct {
 
 static void queue_event(struct libinput_event *ev);
 static struct libinput_event *alloc_event(int type, struct libinput_device *dev);
+static struct libinput_device *find_or_create_device(int id, int caps, const char *name);
 
-/* ── Background thread: receive Mach IPC events ─────────────────────── */
+// ── Helpers for SDL injection ──────────────────────────────────────────
 
-static void *recv_thread(void *arg)
-{
-    (void)arg;
-    while (g.running) {
-        union {
-            input_ipc_event_t event;
-            uint8_t padding[sizeof(input_ipc_event_t) + 64];
-        } buf = {0};
-        input_ipc_event_t *msg = &buf.event;
-        msg->header.msgh_size       = sizeof(buf);
-        msg->header.msgh_local_port = g.recv_port;
-
-        kern_return_t kr = mach_msg(&msg->header, MACH_RCV_MSG, 0, sizeof(buf),
-                                     g.recv_port, MACH_MSG_TIMEOUT_NONE,
-                                     MACH_PORT_NULL);
-        if (kr != KERN_SUCCESS) {
-            if (g.running)
-                fprintf(stderr, "[libinput] mach_msg recv: %s\n",
-                        mach_error_string(kr));
-            continue;
-        }
-        fprintf(stderr, "[libinput] recv event_type=%d id=%d\n",
-                msg->event_type, msg->device_id);
-        if (msg->header.msgh_id != INPUT_IPC_EVENT_ID) {
-            fprintf(stderr, "[libinput] unexpected msgh_id %d\n",
-                    msg->header.msgh_id);
-            continue;
-        }
-
-        struct libinput_device *dev = NULL;
-        for (int i = 0; i < g.num_devices; i++) {
-            if (g.devices[i].id == msg->device_id) {
-                dev = &g.devices[i];
-                break;
-            }
-        }
-
-        struct libinput_event *ev = NULL;
-
-        switch (msg->event_type) {
-        case INPUT_IPC_EVENT_DEVICE_ADDED: {
-            fprintf(stderr, "[libinput] DEVICE_ADDED id=%d caps=%d name=\"%s\"\n",
-                    msg->device_id, msg->device_caps, msg->device_name);
-            if (g.num_devices >= MAX_DEVICES) break;
-            dev = &g.devices[g.num_devices++];
-            memset(dev, 0, sizeof(*dev));
-            dev->id = msg->device_id;
-            dev->capabilities = msg->device_caps;
-            strncpy(dev->name, msg->device_name, sizeof(dev->name) - 1);
-            snprintf(dev->sysname, sizeof(dev->sysname), "event%d", msg->device_id);
-            snprintf(dev->seat.logical_name, sizeof(dev->seat.logical_name),
-                     "seat0");
-            ev = alloc_event(LIBINPUT_EVENT_DEVICE_ADDED, dev);
-            break;
-        }
-        case INPUT_IPC_EVENT_DEVICE_REMOVED:
-            ev = alloc_event(LIBINPUT_EVENT_DEVICE_REMOVED, dev);
-            break;
-        case INPUT_IPC_EVENT_KEYBOARD_KEY: {
-            uint16_t key = msg->key & 0x3FF;
-            int byte = key / 8, bit = key % 8;
-            int already_pressed = (g.key_state_map[byte] >> bit) & 1;
-            int state_changed = 0;
-            if (msg->key_state == LIBINPUT_KEY_STATE_PRESSED) {
-                if (!already_pressed) {
-                    g.pressed_keys++;
-                    g.key_state_map[byte] |= (1 << bit);
-                    state_changed = 1;
-                }
-            } else {
-                if (already_pressed) {
-                    g.pressed_keys--;
-                    g.key_state_map[byte] &= ~(1 << bit);
-                    state_changed = 1;
-                }
-            }
-            if (!state_changed) break;
-            ev = alloc_event(LIBINPUT_EVENT_KEYBOARD_KEY, dev);
-            if (ev) {
-                ev->keyboard.key = msg->key;
-                ev->keyboard.key_state = msg->key_state;
-                ev->keyboard.seat_key_count = g.pressed_keys;
-                ev->keyboard.time_usec = msg->time_usec;
-            }
-            break;
-        }
-        case INPUT_IPC_EVENT_POINTER_MOTION:
-            ev = alloc_event(LIBINPUT_EVENT_POINTER_MOTION, dev);
-            if (ev) {
-                ev->pointer.dx = msg->pointer_dx;
-                ev->pointer.dy = msg->pointer_dy;
-                ev->pointer.dx_unaccel = msg->pointer_dx;
-                ev->pointer.dy_unaccel = msg->pointer_dy;
-                ev->pointer.time_usec = msg->time_usec;
-            }
-            break;
-        case INPUT_IPC_EVENT_POINTER_BUTTON: {
-            uint32_t btn_bit = 1u << (msg->pointer_button & 31);
-            int already_pressed = (g.button_state_mask & btn_bit) != 0;
-            int state_changed = 0;
-            if (msg->pointer_button_state == LIBINPUT_BUTTON_STATE_PRESSED) {
-                if (!already_pressed) {
-                    g.pressed_buttons++;
-                    g.button_state_mask |= btn_bit;
-                    state_changed = 1;
-                }
-            } else {
-                if (already_pressed) {
-                    g.pressed_buttons--;
-                    g.button_state_mask &= ~btn_bit;
-                    state_changed = 1;
-                }
-            }
-            if (!state_changed) break;
-            ev = alloc_event(LIBINPUT_EVENT_POINTER_BUTTON, dev);
-            if (ev) {
-                ev->pointer.button = msg->pointer_button;
-                ev->pointer.button_state = msg->pointer_button_state;
-                ev->pointer.seat_button_count = g.pressed_buttons;
-                ev->pointer.time_usec = msg->time_usec;
-            }
-            fprintf(stderr, "[libinput] button %u %s count=%d mask=0x%x\n",
-                    msg->pointer_button,
-                    msg->pointer_button_state ? "down" : "up",
-                    g.pressed_buttons, g.button_state_mask);
-            break;
-        }
-        case INPUT_IPC_EVENT_POINTER_AXIS:
-            ev = alloc_event(LIBINPUT_EVENT_POINTER_AXIS, dev);
-            if (ev) {
-                int axis = msg->pointer_axis;
-                if (axis >= 0 && axis < 2)
-                    ev->pointer.axis_value[axis] = msg->pointer_axis_value;
-                ev->pointer.axis_source = LIBINPUT_POINTER_AXIS_SOURCE_FINGER;
-                ev->pointer.time_usec = msg->time_usec;
-            }
-            break;
-        case INPUT_IPC_EVENT_TOUCH_DOWN:
-        case INPUT_IPC_EVENT_TOUCH_UP:
-        case INPUT_IPC_EVENT_TOUCH_MOTION:
-        case INPUT_IPC_EVENT_TOUCH_FRAME:
-            ev = alloc_event(msg->event_type == INPUT_IPC_EVENT_TOUCH_DOWN
-                             ? LIBINPUT_EVENT_TOUCH_DOWN
-                             : msg->event_type == INPUT_IPC_EVENT_TOUCH_UP
-                             ? LIBINPUT_EVENT_TOUCH_UP
-                             : msg->event_type == INPUT_IPC_EVENT_TOUCH_MOTION
-                             ? LIBINPUT_EVENT_TOUCH_MOTION
-                             : LIBINPUT_EVENT_TOUCH_FRAME, dev);
-            if (ev) {
-                ev->touch.seat_slot = msg->touch_slot;
-                ev->touch.x = msg->touch_x;
-                ev->touch.y = msg->touch_y;
-                ev->touch.time_usec = msg->time_usec;
-            }
-            break;
-        }
-        if (ev)
-            queue_event(ev);
+static struct libinput_device *find_or_create_device(int id, int caps, const char *name) {
+    for (int i = 0; i < g.num_devices; i++) {
+        if (g.devices[i].id == id) return &g.devices[i];
     }
-    return NULL;
+    if (g.num_devices >= MAX_DEVICES) return NULL;
+    struct libinput_device *dev = &g.devices[g.num_devices++];
+    memset(dev, 0, sizeof(*dev));
+    dev->id = id;
+    dev->capabilities = caps;
+    if (name) strncpy(dev->name, name, sizeof(dev->name)-1);
+    else snprintf(dev->name, sizeof(dev->name), "device%d", id);
+    snprintf(dev->sysname, sizeof(dev->sysname), "event%d", id);
+    snprintf(dev->seat.logical_name, sizeof(dev->seat.logical_name), "seat0");
+    return dev;
+}
+
+static void ensure_devices(void) {
+    if (g.num_devices == 0) {
+        struct libinput_device *kb = find_or_create_device(0, INPUT_IPC_CAP_KEYBOARD, "SDL Keyboard");
+        struct libinput_device *ptr = find_or_create_device(1, INPUT_IPC_CAP_POINTER, "SDL Pointer");
+        (void)kb; (void)ptr;
+        // Queue DEVICE_ADDED events
+        if (kb) {
+            struct libinput_event *ev = alloc_event(LIBINPUT_EVENT_DEVICE_ADDED, kb);
+            if (ev) queue_event(ev);
+        }
+        if (ptr) {
+            struct libinput_event *ev = alloc_event(LIBINPUT_EVENT_DEVICE_ADDED, ptr);
+            if (ev) queue_event(ev);
+        }
+    }
+}
+
+// SDL backend will call these to inject input
+void libinput_sdl_inject_device_added(void) {
+    ensure_devices();
+}
+
+void libinput_sdl_inject_key(uint32_t scancode, int pressed, uint64_t time_usec) {
+    ensure_devices();
+    uint16_t key = scancode & 0x3FF;
+    int byte = key / 8, bit = key % 8;
+    if (byte >= (int)sizeof(g.key_state_map)) return;
+    int already_pressed = (g.key_state_map[byte] >> bit) & 1;
+    int state_changed = 0;
+    if (pressed) {
+        if (!already_pressed) {
+            g.pressed_keys++;
+            g.key_state_map[byte] |= (1 << bit);
+            state_changed = 1;
+        }
+    } else {
+        if (already_pressed) {
+            g.pressed_keys--;
+            g.key_state_map[byte] &= ~(1 << bit);
+            state_changed = 1;
+        }
+    }
+    if (!state_changed) return;
+    struct libinput_device *dev = find_or_create_device(0, INPUT_IPC_CAP_KEYBOARD, "SDL Keyboard");
+    struct libinput_event *ev = alloc_event(LIBINPUT_EVENT_KEYBOARD_KEY, dev);
+    if (ev) {
+        ev->keyboard.key = scancode;
+        ev->keyboard.key_state = pressed ? LIBINPUT_KEY_STATE_PRESSED : LIBINPUT_KEY_STATE_RELEASED;
+        ev->keyboard.seat_key_count = g.pressed_keys;
+        ev->keyboard.time_usec = time_usec;
+        queue_event(ev);
+    }
+}
+
+void libinput_sdl_inject_motion(double dx, double dy, uint64_t time_usec) {
+    ensure_devices();
+    struct libinput_device *dev = find_or_create_device(1, INPUT_IPC_CAP_POINTER, "SDL Pointer");
+    struct libinput_event *ev = alloc_event(LIBINPUT_EVENT_POINTER_MOTION, dev);
+    if (ev) {
+        ev->pointer.dx = dx;
+        ev->pointer.dy = dy;
+        ev->pointer.dx_unaccel = dx;
+        ev->pointer.dy_unaccel = dy;
+        ev->pointer.time_usec = time_usec;
+        queue_event(ev);
+    }
+}
+
+void libinput_sdl_inject_button(int button, int pressed, uint64_t time_usec) {
+    ensure_devices();
+    uint32_t btn_bit = 1u << (button & 31);
+    int already_pressed = (g.button_state_mask & btn_bit) != 0;
+    int state_changed = 0;
+    if (pressed) {
+        if (!already_pressed) {
+            g.pressed_buttons++;
+            g.button_state_mask |= btn_bit;
+            state_changed = 1;
+        }
+    } else {
+        if (already_pressed) {
+            g.pressed_buttons--;
+            g.button_state_mask &= ~btn_bit;
+            state_changed = 1;
+        }
+    }
+    if (!state_changed) return;
+    struct libinput_device *dev = find_or_create_device(1, INPUT_IPC_CAP_POINTER, "SDL Pointer");
+    struct libinput_event *ev = alloc_event(LIBINPUT_EVENT_POINTER_BUTTON, dev);
+    if (ev) {
+        ev->pointer.button = button;
+        ev->pointer.button_state = pressed ? LIBINPUT_BUTTON_STATE_PRESSED : LIBINPUT_BUTTON_STATE_RELEASED;
+        ev->pointer.seat_button_count = g.pressed_buttons;
+        ev->pointer.time_usec = time_usec;
+        queue_event(ev);
+    }
+}
+
+void libinput_sdl_inject_axis(int axis, double value, uint64_t time_usec) {
+    ensure_devices();
+    struct libinput_device *dev = find_or_create_device(1, INPUT_IPC_CAP_POINTER, "SDL Pointer");
+    struct libinput_event *ev = alloc_event(LIBINPUT_EVENT_POINTER_AXIS, dev);
+    if (ev) {
+        if (axis >=0 && axis <2) ev->pointer.axis_value[axis] = value;
+        ev->pointer.axis_source = LIBINPUT_POINTER_AXIS_SOURCE_FINGER;
+        ev->pointer.time_usec = time_usec;
+        queue_event(ev);
+    }
 }
 
 /* ── Event queue ────────────────────────────────────────────────────── */
@@ -298,49 +258,10 @@ static void queue_event(struct libinput_event *ev)
 
 /* ── Connect to inputd via Mach IPC ──────────────────────────────────── */
 
-static int connect_inputd(void)
-{
-    kern_return_t kr = bootstrap_look_up(bootstrap_port, INPUT_IPC_SERVICE_NAME,
-                                         &g.inputd_port);
-    if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "[libinput] inputd not available (%s), using stub\n",
-                mach_error_string(kr));
-        return -1;
-    }
-
-    kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE,
-                            &g.recv_port);
-    if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "[libinput] mach_port_allocate: %s\n",
-                mach_error_string(kr));
-        return -1;
-    }
-
-    input_ipc_subscribe_t sub = {0};
-    sub.header.msgh_bits = MACH_MSGH_BITS_COMPLEX
-                         | MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
-    sub.header.msgh_remote_port = g.inputd_port;
-    sub.header.msgh_local_port  = MACH_PORT_NULL;
-    sub.header.msgh_id          = INPUT_IPC_SUBSCRIBE_ID;
-    sub.header.msgh_size        = sizeof(sub);
-    sub.body.msgh_descriptor_count = 1;
-    sub.client_port.name        = g.recv_port;
-    sub.client_port.disposition = MACH_MSG_TYPE_MAKE_SEND;
-    sub.client_port.type        = MACH_MSG_PORT_DESCRIPTOR;
-
-    kr = mach_msg(&sub.header, MACH_SEND_MSG, sizeof(sub), 0, MACH_PORT_NULL,
-                  MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-    if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "[libinput] mach_msg subscribe: %s\n",
-                mach_error_string(kr));
-        return -1;
-    }
-
-    fprintf(stderr, "[libinput] subscribed to inputd\n");
-    return 0;
-}
-
 /* ── libinput API implementation ─────────────────────────────────────── */
+
+// Forward declare SDL backend init (optional lazy init)
+__attribute__((weak)) void sdl_backend_init(void);
 
 struct libinput *libinput_udev_create_context(
     const struct libinput_interface *iface, void *user_data, struct udev *udev)
@@ -358,19 +279,16 @@ struct libinput *libinput_udev_create_context(
         }
     }
 
-    int connected = 0;
     if (!g.connected) {
         g.connected = true;
         g.running = true;
-        if (connect_inputd() == 0) {
-            connected = 1;
-            pthread_mutex_init(&g.ev_lock, NULL);
-            pthread_create(&g.recv_thread, NULL, recv_thread, NULL);
-            pthread_detach(g.recv_thread);
-        }
+        pthread_mutex_init(&g.ev_lock, NULL);
+        // Ensure SDL devices exist
+        ensure_devices();
+        // Lazily init SDL backend so window appears even if weston hasn't done a page flip yet
+        if (sdl_backend_init) sdl_backend_init();
     }
 
-    (void)connected;
     memset(&g.ctx, 0, sizeof(g.ctx));
     g.ctx.user_data = user_data;
     return &g.ctx;

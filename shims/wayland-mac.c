@@ -1,26 +1,22 @@
-#include <_abort.h>
-#include <_stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <mach/mach.h>
-#include <mach-o/getsect.h>
-#include <mach-o/ldsyms.h>
-#include <servers/bootstrap.h>
-#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #include <stdarg.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/event.h>
+#include <sys/select.h>
+#include <sys/time.h>
 
 /* DRM ioctl dispatch — intercepts open/ioctl for /dev/dri/card* */
 #include <sys/ioctl.h>
 #include "drm_ioctl.h"
+#include "sdl_backend.h"
 
 /* epoll shim functions we hook into — forward-declared to avoid pulling
  * in epoll_shim_ctx.h and its system-compat dependencies */
@@ -29,10 +25,6 @@ ssize_t epoll_shim_write(int fd, void const *buf, size_t nbytes);
 int     epoll_shim_close(int fd);
 int     epoll_shim_poll(struct pollfd fds[], nfds_t nfds, int timeout);
 int     epoll_shim_fcntl(int fd, int cmd, ...);
-
-#define SUPPORT_DIR "/tmp/libwayland-support"
-
-extern char **environ;
 
 /* ── Dobby hook function pointer definitions ──────────────────────────
  * These are referenced via `extern` by wrap.c in epoll-shim-interpose.
@@ -47,6 +39,9 @@ typeof(poll)  *wrap_real_poll;
 typeof(fcntl) *wrap_real_fcntl;
 typeof(open)  *wrap_real_open;
 typeof(ioctl) *wrap_real_ioctl;
+typeof(select) *wrap_real_select;
+typeof(kevent) *wrap_real_kevent;
+typeof(kevent64) *wrap_real_kevent64;
 
 static ssize_t hooked_read(int fd, void *buf, size_t nbytes)
 {
@@ -67,7 +62,87 @@ static int hooked_close(int fd)
 
 static int hooked_poll(struct pollfd fds[], nfds_t nfds, int timeout)
 {
-    return epoll_shim_poll(fds, nfds, timeout);
+    // Pump SDL events on main thread before blocking. This ensures keyboard/mouse
+    // events from the SDL window are translated to libinput events.
+    sdl_backend_pump_events();
+    // Cap timeout to 16ms so SDL events are polled at ~60Hz even when weston blocks with -1
+    int capped = timeout;
+    if (capped < 0 || capped > 16) capped = 16;
+    int ret = epoll_shim_poll(fds, nfds, capped);
+    // Pump again after wake to catch events that arrived during poll
+    sdl_backend_pump_events();
+    // If we capped timeout but original was longer, and we got no events, simulate timeout behavior
+    if (ret == 0 && capped != timeout) {
+        // If original timeout was infinite or longer, don't return 0 prematurely if no fds ready?
+        // But SDL pump needs frequent wakeups, so we return 0 to let caller loop and check again.
+        // For correctness, if caller expects -1 (infinite) we still return 0 with no events, which will cause busy loop but at 60Hz it's okay.
+    }
+    return ret;
+}
+
+static int hooked_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout)
+{
+    sdl_backend_pump_events();
+    // Cap timeout to 16ms
+    struct timeval capped_tv;
+    struct timeval *capped_ptr = timeout;
+    if (timeout) {
+        capped_tv = *timeout;
+        if (capped_tv.tv_sec > 0 || capped_tv.tv_usec > 16000) {
+            capped_tv.tv_sec = 0;
+            capped_tv.tv_usec = 16000;
+            capped_ptr = &capped_tv;
+        }
+    } else {
+        capped_tv.tv_sec = 0;
+        capped_tv.tv_usec = 16000;
+        capped_ptr = &capped_tv;
+    }
+    int ret = wrap_real_select(nfds, readfds, writefds, exceptfds, capped_ptr);
+    sdl_backend_pump_events();
+    return ret;
+}
+
+static int hooked_kevent(int kq, const struct kevent *changelist, int nchanges,
+                         struct kevent *eventlist, int nevents,
+                         const struct timespec *timeout)
+{
+    sdl_backend_pump_events();
+    struct timespec capped_ts;
+    const struct timespec *capped_ptr = timeout;
+    if (!timeout) {
+        capped_ts.tv_sec = 0;
+        capped_ts.tv_nsec = 16 * 1000000;
+        capped_ptr = &capped_ts;
+    } else if (timeout->tv_sec > 0 || timeout->tv_nsec > 16 * 1000000) {
+        capped_ts.tv_sec = 0;
+        capped_ts.tv_nsec = 16 * 1000000;
+        capped_ptr = &capped_ts;
+    }
+    int ret = wrap_real_kevent(kq, changelist, nchanges, eventlist, nevents, capped_ptr);
+    sdl_backend_pump_events();
+    return ret;
+}
+
+static int hooked_kevent64(int kq, const struct kevent64_s *changelist, int nchanges,
+                           struct kevent64_s *eventlist, int nevents,
+                           unsigned int flags, const struct timespec *timeout)
+{
+    sdl_backend_pump_events();
+    struct timespec capped_ts;
+    const struct timespec *capped_ptr = timeout;
+    if (!timeout) {
+        capped_ts.tv_sec = 0;
+        capped_ts.tv_nsec = 16 * 1000000;
+        capped_ptr = &capped_ts;
+    } else if (timeout->tv_sec > 0 || timeout->tv_nsec > 16 * 1000000) {
+        capped_ts.tv_sec = 0;
+        capped_ts.tv_nsec = 16 * 1000000;
+        capped_ptr = &capped_ts;
+    }
+    int ret = wrap_real_kevent64(kq, changelist, nchanges, eventlist, nevents, flags, capped_ptr);
+    sdl_backend_pump_events();
+    return ret;
 }
 
 static int hooked_fcntl(int fd, int cmd, ...)
@@ -121,120 +196,27 @@ static void install_epoll_hooks(void)
             abort();                                                      \
         }                                                                 \
     } while (0)
+#define HOOK_OPT(fun)                                                     \
+    do {                                                                  \
+        int ret = DobbyHook((void *)fun, (void *)hooked_##fun,            \
+                            (void **)&wrap_real_##fun);                   \
+        if (ret != 0) {                                                   \
+            fprintf(stderr,                                               \
+                    "[wayland-mac] optional hook \"" #fun "\" not found (%d), skipping\n", ret); \
+        }                                                                 \
+    } while (0)
 
     HOOK(read);
     HOOK(write);
     HOOK(close);
     HOOK(poll);
     HOOK(fcntl);
+    HOOK_OPT(select);
+    HOOK_OPT(kevent);
+    HOOK_OPT(kevent64);
 
 #undef HOOK
-}
-
-static int extract_section(const char *segname, const char *sectname,
-                            const char *destpath) {
-    unsigned long size = 0;
-    const uint8_t *data = getsectiondata(&_mh_dylib_header, segname, sectname,
-                                         &size);
-    if (!data || size == 0) {
-        fprintf(stderr, "[wayland-mac] section %s,%s not found\n",
-                segname, sectname);
-        return -1;
-    }
-
-    int fd = open(destpath, O_WRONLY | O_CREAT | O_TRUNC, 0755);
-    if (fd < 0) {
-        fprintf(stderr, "[wayland-mac] open %s: %s\n", destpath,
-                strerror(errno));
-        return -1;
-    }
-
-    ssize_t written = write(fd, data, size);
-    close(fd);
-
-    if (written != (ssize_t)size) {
-        fprintf(stderr, "[wayland-mac] write %s: short write\n", destpath);
-        return -1;
-    }
-
-    return 0;
-}
-
-/* Build environment without DYLD_INSERT_LIBRARIES so spawned children
- * don't recursively load our dylib. */
-static char **clean_environ(void) {
-    static char **clean = NULL;
-    if (clean) return clean;
-
-    int count = 0;
-    while (environ[count]) count++;
-
-    /* Each entry survives unless it starts with DYLD_INSERT_LIBRARIES=.
-     * Worst case: all survive. */
-    clean = calloc(count + 1, sizeof(char *));
-    if (!clean) return environ;
-
-    int j = 0;
-    for (int i = 0; i < count; i++) {
-        if (strncmp(environ[i], "DYLD_INSERT_LIBRARIES=", 22) == 0)
-            continue;
-        clean[j++] = environ[i];
-    }
-    clean[j] = NULL;
-
-    unsetenv("DYLD_INSERT_LIBRARIES");
-
-    return clean;
-}
-
-#define POSIX_SPAWN_PROC_TYPE_DAEMON_INTERACTIVE    0x00000400
-#define CS_LAUNCH_TYPE_SYSTEM_SERVICE 1
-int posix_spawnattr_setprocesstype_np(posix_spawnattr_t *, const int);
-int posix_spawnattr_set_launch_type_np(posix_spawnattr_t *attr, int launch_type);
-int posix_spawnattr_set_darwin_role_np(const posix_spawnattr_t * __restrict, uint64_t);
-
-static int spawn_and_wait(const char *path, char *const argv[]) {
-    pid_t pid;
-    posix_spawnattr_t spattr;
-    posix_spawnattr_init(&spattr);
-    posix_spawnattr_setprocesstype_np(&spattr, POSIX_SPAWN_PROC_TYPE_DAEMON_INTERACTIVE);
-    posix_spawnattr_set_launch_type_np(&spattr, CS_LAUNCH_TYPE_SYSTEM_SERVICE);
-
-    int ret = posix_spawn(&pid, path, NULL, &spattr, argv, clean_environ());
-    if (ret != 0) {
-        fprintf(stderr, "[wayland-mac] posix_spawn %s: %s\n", path,
-                strerror(ret));
-        return -1;
-    }
-    int status;
-    if (waitpid(pid, &status, 0) < 0) {
-        fprintf(stderr, "[wayland-mac] waitpid %s: %s\n", path,
-                strerror(errno));
-        return -1;
-    }
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-}
-
-static int spawn_background(const char *path, char *const argv[]) {
-    pid_t pid;
-    posix_spawnattr_t spattr;
-    posix_spawnattr_init(&spattr);
-    posix_spawnattr_setprocesstype_np(&spattr, POSIX_SPAWN_PROC_TYPE_DAEMON_INTERACTIVE);
-    posix_spawnattr_set_launch_type_np(&spattr, CS_LAUNCH_TYPE_SYSTEM_SERVICE);
-
-    if (strstr(path, "framebufferd") != NULL) {
-        posix_spawnattr_set_darwin_role_np(
-            &spattr,
-            0x4); // PRIO_DARWIN_ROLE_UI_FOCAL
-    }
-
-    int ret = posix_spawn(&pid, path, NULL, &spattr, argv, clean_environ());
-    if (ret != 0) {
-        fprintf(stderr, "[wayland-mac] posix_spawn %s: %s\n", path,
-                strerror(ret));
-        return -1;
-    }
-    return 0;
+#undef HOOK_OPT
 }
 
 static void install_drm_hooks(void)
@@ -258,10 +240,9 @@ static void install_drm_hooks(void)
 
 __attribute__((constructor))
 static void wayland_mac_load(void) {
+    // In SDL single-library mode we no longer require root; AMFI patching removed.
     if (getuid() != 0) {
-        fprintf(stderr, "[wayland-mac] must run as root\n");
-        abort();
-        return;
+        fprintf(stderr, "[wayland-mac] running as uid %d (non-root SDL mode)\n", getuid());
     }
 
     /* Create a real pipe dup'd to DRM_VIRTUAL_FD so select/poll work on
@@ -280,95 +261,14 @@ static void wayland_mac_load(void) {
 
     /* Install hooks before anything else — these intercept libc calls
      * (read, write, poll, close, fcntl) and route them through the
-     * epoll shim.  Future DRM hooks go here too. */
+     * epoll shim. */
     install_epoll_hooks();
     install_drm_hooks();
 
-    /* If framebufferd's Mach service is already registered, everything is
-     * already set up — skip support dir, amfi, and framebufferd spawn. */
-    {
-        mach_port_t port = MACH_PORT_NULL;
-        kern_return_t kr = bootstrap_look_up(bootstrap_port,
-                                            "com.wayland-mac.framebufferd",
-                                            &port);
-        if (kr == KERN_SUCCESS) {
-            mach_port_deallocate(mach_task_self(), port);
-            return;  /* already running, nothing to do */
-        }
-    }
-
-    /* Create support directory */
-    if (mkdir(SUPPORT_DIR, 0755) < 0 && errno != EEXIST) {
-        fprintf(stderr, "[wayland-mac] mkdir %s: %s\n", SUPPORT_DIR,
-                strerror(errno));
-        return;
-    }
-
-    const char *amfiexceptiond_path = SUPPORT_DIR "/amfiexceptiond";
-    const char *framebufferd_path    = SUPPORT_DIR "/framebufferd";
-
-    /* Extract and launch amfiexceptiond — wait for it to finish patching AMFI */
-    if (extract_section("__DATA_OBJ", "amfiexceptiond", amfiexceptiond_path) == 0) {
-        char *const argv[] = {
-            (char *)amfiexceptiond_path,
-            NULL
-        };
-        spawn_and_wait(amfiexceptiond_path, argv);
-    }
-
-    /* Extract and launch framebufferd, then wait for its Mach service */
-    if (extract_section("__DATA_OBJ", "framebufferd", framebufferd_path) == 0) {
-        char *const argv[] = {
-            (char *)framebufferd_path,
-            NULL
-        };
-        spawn_background(framebufferd_path, argv);
-    }
-
-
-    /* Extract and launch inputd (input event daemon) */
-    const char *inputd_path = SUPPORT_DIR "/inputd";
-    if (extract_section("__DATA_OBJ", "inputd", inputd_path) == 0) {
-        char *const argv[] = {
-            (char *)inputd_path,
-            NULL
-        };
-        spawn_background(inputd_path, argv);
-    }
-
-    /* Prevent display sleep while weston is running */
-    {
-        char *const argv[] = {
-            (char *)"/usr/bin/caffeinate",
-            (char *)"-d",
-            NULL
-        };
-        spawn_background("/usr/bin/caffeinate", argv);
-    }
-
-    {
-        mach_port_t port = MACH_PORT_NULL;
-        kern_return_t kr;
-        do {
-            kr = bootstrap_look_up(bootstrap_port,
-                                   "com.wayland-mac.inputd", &port);
-            if (kr != KERN_SUCCESS)
-                usleep(5000);
-        } while (kr != KERN_SUCCESS);
-        mach_port_deallocate(mach_task_self(), port);
-    }
-
-    {
-        mach_port_t port = MACH_PORT_NULL;
-        kern_return_t kr;
-        do {
-            kr = bootstrap_look_up(bootstrap_port,
-                                   "com.wayland-mac.framebufferd", &port);
-            if (kr != KERN_SUCCESS)
-                usleep(5000);
-        } while (kr != KERN_SUCCESS);
-        mach_port_deallocate(mach_task_self(), port);
-    }
+    // SDL backend is now lazy-initialised on first DRM page-flip or libinput
+    // context creation. This prevents extra SDL windows in wayland clients
+    // (weston-terminal, etc.) that also load libwayland-mac but never use DRM.
+    fprintf(stderr, "[wayland-mac] SDL single-library mode ready (lazy init, no daemons)\n");
 }
 
 __attribute__((visibility("default")))
