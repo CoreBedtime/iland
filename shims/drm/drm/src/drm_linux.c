@@ -12,8 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <mach/mach.h>
+#include <math.h>
 #include <pthread.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ── dynamic mode table (reads display resolution from plist) ────────── */
@@ -86,9 +88,9 @@ static uint32_t get_display_refresh_rate(void)
         }
         CGDisplayModeRelease(mode);
     }
-    if (refresh < 60) {
-        refresh = 60;
-    }
+    if (refresh < 60) refresh = 60;
+    // Clamp ProMotion/low reports to 120 for smoother FPS
+    if (refresh < 120) refresh = 120;
     return refresh;
 }
 
@@ -758,19 +760,22 @@ int drmHandleEvent(int fd, drmEventContextPtr evctx)
             uint32_t crtc_id = 1;
             void *data = NULL;
             if (!dequeue_flip_event(&crtc_id, &data)) break;
-            struct timeval tv;
-            gettimeofday(&tv, NULL);
-            /* page_flip_handler2 (v2+) provides CRTC ID required for atomic mode */
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            /* page_flip_handler2 (v2+) provides CRTC ID required for atomic mode.
+             * The timestamp MUST be in CLOCK_MONOTONIC (Weston's presentation
+             * clock); passing CLOCK_REALTIME makes Weston think the next
+             * presentation is ~1.7e12 ms away and throttle repaints to ~0 fps. */
             if (evctx->version >= 2 && evctx->page_flip_handler2) {
                 evctx->page_flip_handler2(fd, 0,
-                                          (unsigned int)tv.tv_sec,
-                                          (unsigned int)tv.tv_usec,
+                                          (unsigned int)ts.tv_sec,
+                                          (unsigned int)(ts.tv_nsec / 1000),
                                           crtc_id,
                                           data);
             } else if (evctx->page_flip_handler) {
                 evctx->page_flip_handler(fd, 0,
-                                          (unsigned int)tv.tv_sec,
-                                          (unsigned int)tv.tv_usec,
+                                          (unsigned int)ts.tv_sec,
+                                          (unsigned int)(ts.tv_nsec / 1000),
                                           data);
             }
         }

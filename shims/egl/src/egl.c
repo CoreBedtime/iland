@@ -34,6 +34,8 @@ ANGLE_FN(eglSwapInterval);
 ANGLE_FN(eglCreatePbufferSurface);
 
 static void (*g_glReadPixels)(int, int, int, int, unsigned int, unsigned int, void *) = NULL;
+static unsigned int (*g_glGetError)(void) = NULL;
+static int g_use_bgra = -1; // -1 unknown, 0 no, 1 yes
 
 /* Thread-local reusable pixel buffer to avoid malloc/free per frame */
 static __thread void  *g_pixels    = NULL;
@@ -84,8 +86,14 @@ static void load_gles2(void)
 {
     if (g_glReadPixels) return;
     void *h = dlopen("/opt/local/lib/libGLESv2.dylib", RTLD_LAZY | RTLD_LOCAL);
-    if (!h) return;
+    if (!h) {
+        fprintf(stderr, "[egl] load_gles2: dlopen libGLESv2 failed: %s\n", dlerror());
+        return;
+    }
     g_glReadPixels = dlsym(h, "glReadPixels");
+    g_glGetError = dlsym(h, "glGetError");
+    if (!g_glReadPixels) fprintf(stderr, "[egl] load_gles2: dlsym glReadPixels failed: %s\n", dlerror());
+    else fprintf(stderr, "[egl] load_gles2: glReadPixels loaded %p glGetError %p\n", g_glReadPixels, g_glGetError);
 }
 
 static EGLShimDisplay *unwrap_display(EGLDisplay dpy)
@@ -322,7 +330,12 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface)
     uint32_t h = ss->height;
     size_t total = (size_t)w * h * 4;
 
-    if (!g_glReadPixels) return real_eglSwapBuffers(sd->angle_display, ss->angle_surface);
+    static int swapN = 0;
+    if (swapN++ < 3) fprintf(stderr, "[egl] swap %d %ux%u iosurf %p g_glReadPixels %p\n", swapN, w, h, iosurf, g_glReadPixels);
+    if (!g_glReadPixels) {
+        fprintf(stderr, "[egl] swap: no glReadPixels, returning black\n");
+        return real_eglSwapBuffers(sd->angle_display, ss->angle_surface);
+    }
 
     /* Reuse thread-local buffer to avoid malloc/free per frame */
     if (g_pixels_sz < total) {
@@ -332,8 +345,24 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface)
         g_pixels_sz = total;
     }
 
-    /* Read pixels BEFORE swap — back buffer content is undefined after */
-    g_glReadPixels(0, 0, (int)w, (int)h, 0x1908, 0x1401, g_pixels);
+    /* Read pixels BEFORE swap — back buffer content is undefined after
+     * Try BGRA directly to avoid the extra vImage permute (saves ~8MB/frame). */
+    bool did_bgra = false;
+    if (g_use_bgra != 0) {
+        // 0x80E1 = GL_BGRA_EXT
+        g_glReadPixels(0, 0, (int)w, (int)h, 0x80E1, 0x1401, g_pixels);
+        if (g_glGetError) {
+            unsigned int err = g_glGetError();
+            if (err == 0) { did_bgra = true; if (g_use_bgra == -1) g_use_bgra = 1; }
+            else { if (g_use_bgra == -1) g_use_bgra = 0; }
+        } else {
+            did_bgra = true;
+        }
+    }
+    if (!did_bgra) {
+        if (g_use_bgra == -1) g_use_bgra = 0;
+        g_glReadPixels(0, 0, (int)w, (int)h, 0x1908, 0x1401, g_pixels);
+    }
 
     EGLBoolean ret = real_eglSwapBuffers(sd->angle_display, ss->angle_surface);
     if (!ret) return ret;
@@ -350,14 +379,16 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface)
         memcpy(d, s, (size_t)w * 4);
     }
 
-    /* Channel swap RGBA→BGRA using Accelerate (SIMD on Apple Silicon) */
-    vImage_Buffer buf = {
-        .data     = dst8,
-        .width    = w,
-        .height   = h,
-        .rowBytes = dst_pitch_bytes,
-    };
-    vImagePermuteChannels_ARGB8888(&buf, &buf, kRGBAToBGRAMap, 0);
+    if (!did_bgra) {
+        /* Channel swap RGBA→BGRA using Accelerate (SIMD on Apple Silicon) */
+        vImage_Buffer buf = {
+            .data     = dst8,
+            .width    = w,
+            .height   = h,
+            .rowBytes = dst_pitch_bytes,
+        };
+        vImagePermuteChannels_ARGB8888(&buf, &buf, kRGBAToBGRAMap, 0);
+    }
 
     IOSurfaceUnlock(iosurf, 0, NULL);
 

@@ -3,6 +3,8 @@
 #import <IOSurface/IOSurface.h>
 #include <SDL3/SDL.h>
 #include <CoreGraphics/CoreGraphics.h>
+#include <QuartzCore/QuartzCore.h>
+#include <pthread.h>
 
 /* Private CGS API: lets us hide the cursor even when this process is not the
  * foreground application (our desktop windows can sit behind other apps).
@@ -27,8 +29,53 @@ static uint64_t g_desktopSpace = 0;
  * clean exit and via a signal handler (Ctrl-C / terminate). */
 static bool g_cursor_hidden = false;
 
+// hid_to_evdev mapping (must be before raw_mouse_tap_cb)
+static const uint16_t hid_to_evdev[256] = {
+    [0x04] = 30, [0x05] = 48, [0x06] = 46, [0x07] = 32,
+    [0x08] = 18, [0x09] = 33, [0x0A] = 34, [0x0B] = 35,
+    [0x0C] = 23, [0x0D] = 36, [0x0E] = 37, [0x0F] = 38,
+    [0x10] = 50, [0x11] = 49, [0x12] = 24, [0x13] = 19,
+    [0x14] = 16, [0x15] = 19, [0x16] = 31, [0x17] = 20,
+    [0x18] = 22, [0x19] = 47, [0x1A] = 17, [0x1B] = 45,
+    [0x1C] = 21, [0x1D] = 44, [0x1E] = 2,  [0x1F] = 3,
+    [0x20] = 4,  [0x21] = 5,  [0x22] = 6,  [0x23] = 7,
+    [0x24] = 8,  [0x25] = 9,  [0x26] = 10, [0x27] = 11,
+    [0x28] = 28, [0x29] = 1,  [0x2A] = 14, [0x2B] = 15,
+    [0x2C] = 57, [0x2D] = 12, [0x2E] = 13, [0x2F] = 26,
+    [0x30] = 27, [0x31] = 43, [0x33] = 39, [0x34] = 40,
+    [0x35] = 41, [0x36] = 51, [0x37] = 52, [0x38] = 53,
+    [0x39] = 58, [0x3A] = 59, [0x3B] = 60, [0x3C] = 61,
+    [0x3D] = 62, [0x3E] = 63, [0x3F] = 64, [0x40] = 65,
+    [0x41] = 66, [0x42] = 67, [0x43] = 68, [0x44] = 87,
+    [0x45] = 88, [0x46] = 99, [0x47] = 70, [0x48] = 119,
+    [0x49] = 110, [0x4A] = 102, [0x4B] = 104, [0x4C] = 111,
+    [0x4D] = 107, [0x4E] = 109, [0x4F] = 106, [0x50] = 105,
+    [0x51] = 108, [0x52] = 103, [0x53] = 69, [0x54] = 98,
+    [0x55] = 55, [0x56] = 74, [0x57] = 78, [0x58] = 96,
+    [0x59] = 79, [0x5A] = 80, [0x5B] = 81, [0x5C] = 75,
+    [0x5D] = 76, [0x5E] = 77, [0x5F] = 71, [0x60] = 72,
+    [0x61] = 73, [0x62] = 82, [0x63] = 83, [0x64] = 86,
+    [0x65] = 127, [0x66] = 116, [0x67] = 117, [0x68] = 183,
+    [0x69] = 184, [0x6A] = 185, [0x6B] = 186, [0x6C] = 187,
+    [0x6D] = 188, [0x6E] = 189, [0x6F] = 190, [0x70] = 191,
+    [0x71] = 192, [0x72] = 193, [0x73] = 194, [0xE0] = 29,
+    [0xE1] = 42, [0xE2] = 56, [0xE3] = 125, [0xE4] = 97,
+    [0xE5] = 54, [0xE6] = 100, [0xE7] = 126,
+};
+
+static bool            g_raw_mouse_active = false;
+static CFMachPortRef   g_event_tap = NULL;
+static CFRunLoopSourceRef g_event_tap_src = NULL;
+extern void libinput_sdl_inject_motion(double dx, double dy, uint64_t time_usec);
+extern void libinput_sdl_inject_button(int button, int pressed, uint64_t time_usec);
+extern void libinput_sdl_inject_axis(int axis, double value, uint64_t time_usec);
+extern void libinput_sdl_inject_key(uint32_t scancode, int pressed, uint64_t time_usec);
+static inline uint64_t now_usec(void);
+
 static void show_mac_cursor(void) {
     if (!g_cursor_hidden) return;
+    if (g_event_tap) CGEventTapEnable(g_event_tap, false);
+    CGAssociateMouseAndMouseCursorPosition(true);
     uint32_t count = 0;
     CGDirectDisplayID displays[64];
     if (CGGetOnlineDisplayList(64, displays, &count) == kCGErrorSuccess) {
@@ -36,6 +83,86 @@ static void show_mac_cursor(void) {
             CGDisplayShowCursor(displays[i]);
     }
     g_cursor_hidden = false;
+}
+
+static CGEventRef raw_mouse_tap_cb(CGEventTapProxy proxy, CGEventType type,
+                                   CGEventRef event, void *refcon) {
+    (void)proxy; (void)refcon;
+    uint64_t t = now_usec();
+    switch (type) {
+        case kCGEventMouseMoved:
+        case kCGEventLeftMouseDragged:
+        case kCGEventRightMouseDragged:
+        case kCGEventOtherMouseDragged: {
+            int64_t dx = CGEventGetIntegerValueField(event, kCGMouseEventDeltaX);
+            int64_t dy = CGEventGetIntegerValueField(event, kCGMouseEventDeltaY);
+            if (dx || dy) libinput_sdl_inject_motion((double)dx, (double)dy, t);
+            break;
+        }
+        case kCGEventLeftMouseDown:
+        case kCGEventLeftMouseUp:
+        case kCGEventRightMouseDown:
+        case kCGEventRightMouseUp:
+        case kCGEventOtherMouseDown:
+        case kCGEventOtherMouseUp: {
+            int button = (int)CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber);
+            int pressed = (type == kCGEventLeftMouseDown ||
+                           type == kCGEventRightMouseDown ||
+                           type == kCGEventOtherMouseDown);
+            int evdev;
+            switch (button) {
+                case 0: evdev = 0x110; break;
+                case 1: evdev = 0x112; break;
+                case 2: evdev = 0x111; break;
+                default: evdev = 0x110 + button; break;
+            }
+            libinput_sdl_inject_button(evdev, pressed, t);
+            break;
+        }
+        case kCGEventScrollWheel: {
+            double dx = CGEventGetDoubleValueField(event, kCGScrollWheelEventDeltaAxis2);
+            double dy = CGEventGetDoubleValueField(event, kCGScrollWheelEventDeltaAxis1);
+            if (dy != 0) libinput_sdl_inject_axis(0, dy, t);
+            if (dx != 0) libinput_sdl_inject_axis(1, dx, t);
+            break;
+        }
+        default: break;
+    }
+    return event;
+}
+
+static void *raw_mouse_tap_thread(void *p) {
+    (void)p;
+    if (g_event_tap_src)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), g_event_tap_src, kCFRunLoopCommonModes);
+    CFRunLoopRun();
+    return NULL;
+}
+
+static void start_raw_mouse_capture(void) {
+    if (g_raw_mouse_active) return;
+    CGAssociateMouseAndMouseCursorPosition(false);
+    CGEventMask mask =
+        CGEventMaskBit(kCGEventMouseMoved) |
+        CGEventMaskBit(kCGEventLeftMouseDown)   | CGEventMaskBit(kCGEventLeftMouseUp) |
+        CGEventMaskBit(kCGEventRightMouseDown)  | CGEventMaskBit(kCGEventRightMouseUp) |
+        CGEventMaskBit(kCGEventOtherMouseDown)  | CGEventMaskBit(kCGEventOtherMouseUp) |
+        CGEventMaskBit(kCGEventLeftMouseDragged)| CGEventMaskBit(kCGEventRightMouseDragged) |
+        CGEventMaskBit(kCGEventOtherMouseDragged) |
+        CGEventMaskBit(kCGEventScrollWheel);
+    g_event_tap = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap,
+                                   kCGEventTapOptionDefault, mask,
+                                   raw_mouse_tap_cb, NULL);
+    if (!g_event_tap) {
+        fprintf(stderr, "[sdl] WARNING: could not create event tap (Accessibility permission needed). Falling back to SDL mouse.\n");
+        CGAssociateMouseAndMouseCursorPosition(true);
+        return;
+    }
+    g_event_tap_src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, g_event_tap, 0);
+    pthread_t tid;
+    pthread_create(&tid, NULL, raw_mouse_tap_thread, NULL);
+    g_raw_mouse_active = true;
+    fprintf(stderr, "[sdl] raw capture active (unconstrained pointer)\n");
 }
 
 static void hide_mac_cursor(void) {
@@ -143,14 +270,16 @@ typedef struct {
     bool dirty;
     bool has_window;
     SDL_Window   *window;
-    SDL_Renderer *renderer;
-    SDL_Texture  *texture;
-    int tex_w, tex_h;
     void *nswindow;
+    void *ca_layer;          // CALayer for zero-copy presentation
 } crtc_state_t;
 static crtc_state_t g_crtcs[MAX_CRTCS];
 static int g_crtc_count = 0;
 static pthread_mutex_t g_crtc_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// FPS tracking
+static uint64_t g_fps_last[MAX_CRTCS];
+static uint32_t g_fps_count[MAX_CRTCS];
 
 // Map a CRTC id (1-based, as the virtual DRM assigns) to the CG display
 // bounds (point coordinates in the global Cocoa/CG space). Uses the shared
@@ -202,56 +331,32 @@ static void ensure_crtc_window_locked(crtc_state_t *c) {
     if (nsw) {
         WindowBecomeDesktop((NSWindow *)nsw);
     }
-    SDL_Renderer *ren = SDL_CreateRenderer(win, NULL);
-    if (!ren) {
-        fprintf(stderr, "[sdl] CreateRenderer crtc %u failed: %s\n", c->crtc_id, SDL_GetError());
-        SDL_DestroyWindow(win);
-        return;
-    }
-    SDL_SetRenderVSync(ren, 1);
     SDL_ShowWindow(win);
     c->window = win;
-    c->renderer = ren;
     c->has_window = true;
     c->nswindow = nsw;
     if (c->crtc_id == 1 || !g_nswindow) g_nswindow = nsw;
+
+    // Zero-copy CALayer path (no SDL renderer/texture)
+    NSWindow *nswin = (NSWindow *)nsw;
+    NSView *view = nswin ? [nswin contentView] : nil;
+    if (view) {
+        [view setWantsLayer:YES];
+        CALayer *root = [view layer];
+        CALayer *imgLayer = [CALayer layer];
+        imgLayer.frame = root.bounds;
+        imgLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+        imgLayer.contentsGravity = kCAGravityTopLeft;
+        imgLayer.contentsScale = 1.0;
+        imgLayer.opaque = YES;
+        [root addSublayer:imgLayer];
+        c->ca_layer = (void *)CFBridgingRetain(imgLayer);
+        fprintf(stderr, "[sdl] crtc %u: zero-copy CALayer ready\n", c->crtc_id);
+    }
+
     fprintf(stderr, "[sdl] created window for crtc %u at %dx%d+%d+%d (nswindow %p)\n",
             c->crtc_id, dw, dh, dx, dy, nsw);
 }
-
-// hid_to_evdev mapping
-static const uint16_t hid_to_evdev[256] = {
-    [0x04] = 30, [0x05] = 48, [0x06] = 46, [0x07] = 32,
-    [0x08] = 18, [0x09] = 33, [0x0A] = 34, [0x0B] = 35,
-    [0x0C] = 23, [0x0D] = 36, [0x0E] = 37, [0x0F] = 38,
-    [0x10] = 50, [0x11] = 49, [0x12] = 24, [0x13] = 19,
-    [0x14] = 16, [0x15] = 19, [0x16] = 31, [0x17] = 20,
-    [0x18] = 22, [0x19] = 47, [0x1A] = 17, [0x1B] = 45,
-    [0x1C] = 21, [0x1D] = 44, [0x1E] = 2,  [0x1F] = 3,
-    [0x20] = 4,  [0x21] = 5,  [0x22] = 6,  [0x23] = 7,
-    [0x24] = 8,  [0x25] = 9,  [0x26] = 10, [0x27] = 11,
-    [0x28] = 28, [0x29] = 1,  [0x2A] = 14, [0x2B] = 15,
-    [0x2C] = 57, [0x2D] = 12, [0x2E] = 13, [0x2F] = 26,
-    [0x30] = 27, [0x31] = 43, [0x33] = 39, [0x34] = 40,
-    [0x35] = 41, [0x36] = 51, [0x37] = 52, [0x38] = 53,
-    [0x39] = 58, [0x3A] = 59, [0x3B] = 60, [0x3C] = 61,
-    [0x3D] = 62, [0x3E] = 63, [0x3F] = 64, [0x40] = 65,
-    [0x41] = 66, [0x42] = 67, [0x43] = 68, [0x44] = 87,
-    [0x45] = 88, [0x46] = 99, [0x47] = 70, [0x48] = 119,
-    [0x49] = 110, [0x4A] = 102, [0x4B] = 104, [0x4C] = 111,
-    [0x4D] = 107, [0x4E] = 109, [0x4F] = 106, [0x50] = 105,
-    [0x51] = 108, [0x52] = 103, [0x53] = 69, [0x54] = 98,
-    [0x55] = 55, [0x56] = 74, [0x57] = 78, [0x58] = 96,
-    [0x59] = 79, [0x5A] = 80, [0x5B] = 81, [0x5C] = 75,
-    [0x5D] = 76, [0x5E] = 77, [0x5F] = 71, [0x60] = 72,
-    [0x61] = 73, [0x62] = 82, [0x63] = 83, [0x64] = 86,
-    [0x65] = 127, [0x66] = 116, [0x67] = 117, [0x68] = 183,
-    [0x69] = 184, [0x6A] = 185, [0x6B] = 186, [0x6C] = 187,
-    [0x6D] = 188, [0x6E] = 189, [0x6F] = 190, [0x70] = 191,
-    [0x71] = 192, [0x72] = 193, [0x73] = 194, [0xE0] = 29,
-    [0xE1] = 42, [0xE2] = 56, [0xE3] = 125, [0xE4] = 97,
-    [0xE5] = 54, [0xE6] = 100, [0xE7] = 126,
-};
 
 static inline uint64_t now_usec(void) {
     static mach_timebase_info_data_t tb = {0};
@@ -270,37 +375,33 @@ static inline bool is_main_thread(void) {
 static void render_crtc_locked(crtc_state_t *c) {
     if (!c->surface) return;
     ensure_crtc_window_locked(c);
-    if (!c->has_window || !c->renderer) return;
+    if (!c->has_window) return;
 
     size_t w = IOSurfaceGetWidth(c->surface);
     size_t h = IOSurfaceGetHeight(c->surface);
     if (w == 0 || h == 0) return;
 
-    if (!c->texture || c->tex_w != (int)w || c->tex_h != (int)h) {
-        if (c->texture) SDL_DestroyTexture(c->texture);
-        c->texture = SDL_CreateTexture(c->renderer, SDL_PIXELFORMAT_BGRA32,
-                                       SDL_TEXTUREACCESS_STREAMING, (int)w, (int)h);
-        c->tex_w = (int)w;
-        c->tex_h = (int)h;
-        if (!c->texture) {
-            fprintf(stderr, "[sdl] CreateTexture crtc %u %zux%zu failed: %s\n",
-                    c->crtc_id, w, h, SDL_GetError());
-            return;
-        }
-    }
+    int fidx = (int)c->crtc_id - 1;
+    if (fidx >= 0 && fidx < MAX_CRTCS) g_fps_count[fidx]++;
 
-    if (c->dirty) {
-        IOSurfaceLock(c->surface, kIOSurfaceLockReadOnly, NULL);
-        void *base = IOSurfaceGetBaseAddress(c->surface);
-        uint32_t pitch = (uint32_t)IOSurfaceGetBytesPerRow(c->surface);
-        if (base) SDL_UpdateTexture(c->texture, NULL, base, (int)pitch);
-        IOSurfaceUnlock(c->surface, kIOSurfaceLockReadOnly, NULL);
+    if (c->ca_layer) {
+        CALayer *layer = (__bridge CALayer *)c->ca_layer;
+        CGRect bounds = layer.superlayer.bounds;
+        if (CGRectIsEmpty(bounds)) bounds = CGRectMake(0, 0, (CGFloat)w, (CGFloat)h);
+        CGFloat neededScale = (bounds.size.width > 0) ? (CGFloat)w / bounds.size.width : 1.0;
+        if (neededScale < 0.9) neededScale = 1.0;
+        if (neededScale > 3.0) neededScale = 3.0;
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        layer.frame = bounds;
+        layer.contentsScale = neededScale;
+        layer.contents = (__bridge id)c->surface;
+        [CATransaction commit];
         c->dirty = false;
+        return;
     }
 
-    SDL_RenderClear(c->renderer);
-    SDL_RenderTexture(c->renderer, c->texture, NULL, NULL);
-    SDL_RenderPresent(c->renderer);
+    c->dirty = false;
 }
 
 // Caller must hold g_crtc_lock.
@@ -328,21 +429,22 @@ static void handle_sdl_event(SDL_Event *ev) {
             if (code == 0 && sc != SDL_SCANCODE_UNKNOWN) {
                 fprintf(stderr, "[sdl] unmapped scancode %d (%s)\n", (int)sc, SDL_GetScancodeName(sc));
             } else if (code != 0) {
-                libinput_sdl_inject_key(code, pressed, t);
+                //libinput_sdl_inject_key(code, pressed, t);
             }
             break;
         }
         case SDL_EVENT_MOUSE_MOTION: {
+            if (g_raw_mouse_active) break;
             float dx = ev->motion.xrel;
             float dy = ev->motion.yrel;
             if (dx != 0 || dy != 0) {
-                fprintf(stderr, "[sdl] motion dx=%.2f dy=%.2f\n", dx, dy);
                 libinput_sdl_inject_motion((double)dx, (double)dy, t);
             }
             break;
         }
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
         case SDL_EVENT_MOUSE_BUTTON_UP: {
+            if (g_raw_mouse_active) break;
             int sdl_btn = ev->button.button;
             int evdev_btn = 0;
             switch (sdl_btn) {
@@ -358,6 +460,7 @@ static void handle_sdl_event(SDL_Event *ev) {
             break;
         }
         case SDL_EVENT_MOUSE_WHEEL: {
+            if (g_raw_mouse_active) break;
             float wx = ev->wheel.x;
             float wy = ev->wheel.y;
             if (wy != 0) libinput_sdl_inject_axis(0, (double)wy, t);
@@ -394,6 +497,7 @@ void sdl_backend_init(void) {
         g_running = true;
         libinput_sdl_inject_device_added();
         hide_mac_cursor();
+        start_raw_mouse_capture();
         signal(SIGINT, mac_cursor_restore_handler);
         signal(SIGTERM, mac_cursor_restore_handler);
         atexit(show_mac_cursor);
@@ -477,6 +581,22 @@ void sdl_backend_pump_events(void) {
             CFRelease(pending);
         }
     }
+
+    static uint64_t fps_last = 0;
+    uint64_t now = now_usec();
+    if (fps_last == 0) fps_last = now;
+    if (now - fps_last >= 1000000) {
+        uint64_t dt = now - fps_last;
+        pthread_mutex_lock(&g_crtc_lock);
+        for (int i = 0; i < g_crtc_count; i++) {
+            uint32_t n = g_fps_count[i];
+            int fps = (int)((uint64_t)n * 1000000 / dt);
+            fprintf(stderr, "[sdl] crtc %u: %d fps\n", g_crtcs[i].crtc_id, fps);
+            g_fps_count[i] = 0;
+        }
+        pthread_mutex_unlock(&g_crtc_lock);
+        fps_last = now;
+    }
 }
 
 void sdl_backend_shutdown(void) {
@@ -492,8 +612,7 @@ void sdl_backend_shutdown(void) {
     pthread_mutex_lock(&g_crtc_lock);
     for (int i = 0; i < g_crtc_count; i++) {
         crtc_state_t *c = &g_crtcs[i];
-        if (c->texture) { SDL_DestroyTexture(c->texture); c->texture = NULL; }
-        if (c->renderer) { SDL_DestroyRenderer(c->renderer); c->renderer = NULL; }
+        if (c->ca_layer) { CFRelease(c->ca_layer); c->ca_layer = NULL; }
         if (c->window) { SDL_DestroyWindow(c->window); c->window = NULL; }
         if (c->surface) { CFRelease(c->surface); c->surface = NULL; }
         c->has_window = false;

@@ -52,6 +52,7 @@ env \
     --continue-without-input \
     --config="$TEMP_WESTON_INI" &
 WESTON_PID=$!
+echo "$WESTON_PID" > "$XDG_RUNTIME_DIR/weston.pid" 2>/dev/null; echo "$WESTON_PID" > /tmp/weston.pid 2>/dev/null; echo "$WESTON_PID" > /tmp/weston-runtime-$(id -u)/weston.pid 2>/dev/null || true
 
 # Wait for wayland socket
 echo "=== Waiting for wayland socket ==="
