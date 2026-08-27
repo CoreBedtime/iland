@@ -11,3 +11,4 @@ FrameBufferService/
 weston/
 multitouch_source/
 opencode.json
+.cache/

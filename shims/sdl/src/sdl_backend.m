@@ -429,7 +429,7 @@ static void handle_sdl_event(SDL_Event *ev) {
             if (code == 0 && sc != SDL_SCANCODE_UNKNOWN) {
                 fprintf(stderr, "[sdl] unmapped scancode %d (%s)\n", (int)sc, SDL_GetScancodeName(sc));
             } else if (code != 0) {
-                //libinput_sdl_inject_key(code, pressed, t);
+                libinput_sdl_inject_key(code, pressed, t);
             }
             break;
         }
